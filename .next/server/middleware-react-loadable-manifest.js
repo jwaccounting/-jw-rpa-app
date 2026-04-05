@@ -1,1 +1,0 @@
-self.__REACT_LOADABLE_MANIFEST="{\"lib\\\\arApi.ts -> xlsx\":{\"id\":\"lib\\\\arApi.ts -> xlsx\",\"files\":[\"static/chunks/_app-pages-browser_node_modules_xlsx_xlsx_mjs.js\"]}}"

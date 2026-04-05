@@ -6,3 +6,4 @@ __pycache__/
 *.exe 
 *.dbf 
 .env.local 
+.next/ 
