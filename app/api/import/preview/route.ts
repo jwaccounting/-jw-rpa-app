@@ -14,8 +14,10 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: 'กรุณาเข้าสู่ระบบ' }, { status: 401 })
     }
 
+    const userId = session.user.id ?? ''
+
     // ตรวจสอบ License
-    const license = await checkLicense(session.user.id)
+    const license = await checkLicense(userId)
     if (!license.valid) {
       return NextResponse.json({ error: `License: ${license.reason}` }, { status: 403 })
     }
