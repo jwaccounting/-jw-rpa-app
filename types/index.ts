@@ -1,4 +1,19 @@
 // types/index.ts
+import NextAuth from "next-auth"
+
+declare module "next-auth" {
+  interface Session {
+    user: {
+      name?: string | null
+      email?: string | null
+      image?: string | null
+      role?: string
+    }
+  }
+  interface User {
+    role?: string
+  }
+}
 
 export type JournalType = 'JV' | 'PV' | 'RV' | 'SV' | 'UV' | 'BW' | 'INV' | 'RE' | 'RR' | 'PS' | 'ST'
 
@@ -64,7 +79,7 @@ export const MODULES: ModuleConfig[] = [
     name: 'Purchase Voucher',
     nameTh: 'สมุดรายวันซื้อ',
     desc: 'บันทึกซื้อสินค้า/วัตถุดิบ ทั้งจดและไม่จด VAT',
-    jnltyp: '??',  // ต้องทดสอบกับ Express
+    jnltyp: '??',
     tables: ['GLJNL', 'GLJNLIT'],
     status: 'ready',
     color: 'amber',
