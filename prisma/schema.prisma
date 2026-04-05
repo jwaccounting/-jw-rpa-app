@@ -1,0 +1,81 @@
+// schema.prisma
+// ฐานข้อมูล: User, License, ImportHistory
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id        String   @id @default(cuid())
+  email     String   @unique
+  password  String
+  name      String
+  company   String
+  role      Role     @default(USER)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  license   License?
+  imports   ImportHistory[]
+}
+
+model License {
+  id          String    @id @default(cuid())
+  userId      String    @unique
+  user        User      @relation(fields: [userId], references: [id])
+  key         String    @unique
+  startDate   DateTime  @default(now())
+  expireDate  DateTime
+  isActive    Boolean   @default(true)
+  maxImports  Int?      // null = ไม่จำกัดจำนวนครั้ง
+  usedImports Int       @default(0)
+  note        String?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+}
+
+model ImportHistory {
+  id          String      @id @default(cuid())
+  userId      String
+  user        User        @relation(fields: [userId], references: [id])
+  type        JournalType // PV, RV, SV, BW, JV, UV
+  fileName    String
+  sheetName   String
+  totalRows   Int
+  successRows Int
+  errorRows   Int         @default(0)
+  status      ImportStatus
+  errorLog    String?     // JSON error details
+  dbfPath     String      // Z:\Aulgor path
+  importedAt  DateTime    @default(now())
+}
+
+enum Role {
+  ADMIN
+  USER
+}
+
+enum JournalType {
+  JV
+  PV
+  RV
+  SV
+  UV
+  BW
+  INV
+  RE
+  RR
+  PS
+  ST
+}
+
+enum ImportStatus {
+  SUCCESS
+  PARTIAL
+  FAILED
+}

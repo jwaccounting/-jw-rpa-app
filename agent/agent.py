@@ -1,0 +1,873 @@
+"""
+agent.py — JW RPA Agent v2
+===========================
+เพิ่ม endpoint สำหรับ AR:
+  POST /import/in  — นำเข้าใบแจ้งหนี้ขาย (IN)
+  POST /import/re  — นำเข้ารับชำระหนี้ (RE)
+  GET  /ar/open    — ดึงรายการ IN ที่ยังค้างชำระ
+"""
+
+from license_checker import verify_license
+import sys
+if not verify_license(): sys.exit(1)
+
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+import dbf
+import os
+from datetime import date, datetime
+from decimal import Decimal, ROUND_HALF_UP
+import logging
+from import_in import register_routes as register_in_routes
+
+app = Flask(__name__)
+CORS(app)   # เปิด CORS ให้ browser เรียกได้จาก localhost:3000
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# ============================================================
+DBF_FOLDER = r"Z:\jw-test"
+ENCODING   = "cp874"
+PORT       = 9999
+
+JNLTYP_MAP = {
+    "JV": "05", "PV": "01", "RV": "02",
+    "SV": "03", "UV": "??", "BW": "00",
+}
+BANK_ACCT_MAP = {
+    "S1": "1113-01", "F1": "1114-01", "C1": "1112-01",
+}
+DEBIT_ACCT_BW = "1111-00"
+USERID = "BIT9"
+AR_ACCT  = "1130-01"
+
+# ── GL Config (อ่านจาก GL_config.xlsx) ───────────────────────
+GL_CONFIG_PATH = "E:\\ทดสอบระบบ RPA\\RE_template.xlsx"
+
+def load_gl_config():
+    """โหลด GL account mapping จาก GL_config.xlsx"""
+    cfg = {
+        "default": {"AR_DEFAULT":"1130-01","WHT":"1151-02","FEE":"5360-04","SUSPEND":"9999-99"},
+        "ar": {},    # CUSCOD → ACCNUM
+        "bank": {},  # BNKCOD → ACCNUM
+    }
+    try:
+        import openpyxl
+        wb = openpyxl.load_workbook(GL_CONFIG_PATH, data_only=True)
+
+        # GL_Default sheet
+        if "GL_บัญชีหลัก" in wb.sheetnames:
+            ws = wb["GL_บัญชีหลัก"]
+            for row in ws.iter_rows(min_row=3, values_only=True):
+                if row[0] and row[1]:
+                    cfg["default"][str(row[0]).strip()] = str(row[1]).strip()
+
+        # AR_Account sheet
+        if "GL_ลูกหนี้ตามลูกค้า" in wb.sheetnames:
+            ws = wb["GL_ลูกหนี้ตามลูกค้า"]
+            for row in ws.iter_rows(min_row=3, values_only=True):
+                if row[0] and row[1]:
+                    cfg["ar"][str(row[0]).strip()] = str(row[1]).strip()
+
+        # Bank_Account sheet
+        if "GL_บัญชีธนาคาร" in wb.sheetnames:
+            ws = wb["GL_บัญชีธนาคาร"]
+            for row in ws.iter_rows(min_row=3, values_only=True):
+                if row[0] and row[1]:
+                    cfg["bank"][str(row[0]).strip()] = str(row[1]).strip()
+
+        logger.info(f"[Config] โหลด GL_config.xlsx สำเร็จ")
+    except Exception as e:
+        logger.warning(f"[Config] ใช้ค่า default: {e}")
+    return cfg
+
+def load_cust_names():
+    """โหลดชื่อลูกค้าจาก ARCUST.DBF"""
+    names = {}
+    path = os.path.join(DBF_FOLDER, "ARMAS.DBF")
+    try:
+        t = dbf.Table(path, codepage=ENCODING)
+        t.open(mode=dbf.READ_ONLY)
+        fname = list(t.field_names)
+        name_field = next((f for f in ['CUSNAM','CUSNAME','CUSTNAM','CUSTNAME'] if f in fname), None)
+        for rec in t:
+            if dbf.is_deleted(rec): continue
+            cod = str(rec.CUSCOD).strip()
+            name = str(getattr(rec, name_field, "") or "").strip() if name_field else ""
+            if cod: names[cod] = name
+        t.close()
+    except Exception as e:
+        logger.warning(f"load_cust_names: {e}")
+    return names
+
+def get_ar_acct(cfg, cuscod):
+    return cfg["ar"].get(cuscod, cfg["ar"].get("*", cfg["default"]["AR_DEFAULT"]))
+
+def get_bank_acct(cfg, bnkcod):
+    return cfg["bank"].get(bnkcod, cfg["bank"].get("*", "1113-00"))
+
+def get_default(cfg, key):
+    return cfg["default"].get(key, "9999-99")   # บัญชีลูกหนี้การค้า (Dr. ฝั่ง IN)
+# ============================================================
+
+
+# ── helpers ──────────────────────────────────────────────────
+
+def stkcod_to_gl(stkcod: str) -> str:
+    """แปลง STKCOD → GL account: '4100-02-09' → '4100-02'"""
+    parts = stkcod.strip().split("-")
+    if len(parts) >= 2:
+        return f"{parts[0]}-{parts[1]}"
+    return stkcod
+
+def get_fields(filepath):
+    t = dbf.Table(filepath, codepage=ENCODING)
+    t.open(mode=dbf.READ_ONLY)
+    fields = list(t.field_names)
+    t.close()
+    return fields
+
+def mk(fields, m):
+    return {f: m[f] for f in fields if f in m}
+
+def sstr(val, maxlen):
+    s = str(val) if val is not None else ""
+    enc = s.encode(ENCODING, errors="replace")
+    return enc[:maxlen].decode(ENCODING, errors="replace")
+
+def parse_date(date_str):
+    if not date_str:
+        return date.today()
+    if isinstance(date_str, date):
+        return date_str
+    s = str(date_str).strip()
+    # DD/MM/YYYY หรือ DD/MM/YY
+    if "/" in s:
+        parts = s.split("/")
+        day, month, yr = int(parts[0]), int(parts[1]), int(parts[2])
+        if yr > 2400: yr -= 543
+        elif yr < 100: yr = yr + 2500 - 543
+        return date(yr, month, day)
+    try:
+        return datetime.fromisoformat(s).date()
+    except:
+        return date.today()
+
+def calc_vat(total_incl, vatrat=7):
+    net = Decimal(str(total_incl))
+    rate = Decimal(str(vatrat))
+    vatamt = (net * rate / (100 + rate)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    before = net - vatamt
+    return float(before), float(vatamt), float(net)
+
+def check_dup_artrn(docnum, rectyp=None):
+    """ตรวจซ้ำใน ARTRN — ข้าม deleted records (ที่ลบผ่าน Express แล้ว)"""
+    path = os.path.join(DBF_FOLDER, "ARTRN.DBF")
+    try:
+        t = dbf.Table(path, codepage=ENCODING)
+        t.open(mode=dbf.READ_ONLY)
+        for rec in t:
+            if dbf.is_deleted(rec): continue   # ข้าม record ที่ลบแล้ว
+            if str(rec.DOCNUM).strip() == docnum:
+                if rectyp is None or str(rec.RECTYP).strip() == rectyp:
+                    t.close(); return True
+        t.close()
+    except:
+        pass
+    return False
+
+def get_in_remamt(docnum):
+    path = os.path.join(DBF_FOLDER, "ARTRN.DBF")
+    try:
+        t = dbf.Table(path, codepage=ENCODING)
+        t.open(mode=dbf.READ_ONLY)
+        for rec in t:
+            if str(rec.DOCNUM).strip() == docnum:
+                result = float(rec.NETAMT or 0), float(rec.REMAMT or 0)
+                t.close(); return result
+        t.close()
+    except:
+        pass
+    return 0.0, 0.0
+
+
+# ── GL (เดิม) ─────────────────────────────────────────────────
+
+def write_gl_records(pvs, jnltyp):
+    hdr_path = os.path.join(DBF_FOLDER, "GLJNL.DBF")
+    dtl_path = os.path.join(DBF_FOLDER, "GLJNLIT.DBF")
+    hdr_fields = get_fields(hdr_path)
+    dtl_fields = get_fields(dtl_path)
+    th = dbf.Table(hdr_path, codepage=ENCODING)
+    td = dbf.Table(dtl_path, codepage=ENCODING)
+    th.open(mode=dbf.READ_WRITE)
+    td.open(mode=dbf.READ_WRITE)
+    today = date.today()
+    ok = err = 0
+    for pv in pvs:
+        try:
+            voucher = sstr(pv["docno"], 12)
+            voudat  = parse_date(pv.get("date"))
+            descrp  = sstr(pv.get("desc", ""), 50)
+            hmap = {"JNLTYP":jnltyp,"BATCH":"","VOUDAT":voudat,"VOUCHER":voucher,"REFNUM":voucher,"SRCJNL":"GL","DESCRP":descrp,"REVERSE":" ","TRNSTAT":"P","DOCSTAT":"N","CREDAT":today,"CHGDAT":today}
+            th.append(mk(hdr_fields, hmap))
+            for seq, line in enumerate(pv.get("lines", []), start=1):
+                acct  = sstr(line.get("acct", ""), 15)
+                desc  = sstr(line.get("desc", descrp), 50)
+                seqit = str(seq).zfill(2)
+                debit  = float(line.get("debit",  0))
+                credit = float(line.get("credit", 0))
+                amount = debit if debit > 0 else credit
+                trntyp = "0" if debit > 0 else "1"
+                dmap = {"VOUCHER":voucher,"SEQIT":seqit,"VOUDAT":voudat,"ACCNUM":acct,"DESCRP":desc,"TRNTYP":trntyp,"AMOUNT":amount,"CHGDAT":today}
+                td.append(mk(dtl_fields, dmap))
+            ok += 1
+        except Exception as e:
+            logger.error(f"  ERR {pv.get('docno')}: {e}")
+            err += 1
+    th.close(); td.close()
+    return ok, err
+
+def write_bw_records(bws):
+    hdr_path   = os.path.join(DBF_FOLDER, "GLJNL.DBF")
+    dtl_path   = os.path.join(DBF_FOLDER, "GLJNLIT.DBF")
+    bktrn_path = os.path.join(DBF_FOLDER, "BKTRN.DBF")
+    hdr_fields   = get_fields(hdr_path)
+    dtl_fields   = get_fields(dtl_path)
+    bktrn_fields = get_fields(bktrn_path)
+    th = dbf.Table(hdr_path, codepage=ENCODING); th.open(mode=dbf.READ_WRITE)
+    td = dbf.Table(dtl_path, codepage=ENCODING); td.open(mode=dbf.READ_WRITE)
+    tb = dbf.Table(bktrn_path, codepage=ENCODING); tb.open(mode=dbf.READ_WRITE)
+    today = date.today()
+    ok = err = 0
+    for bw in bws:
+        try:
+            voucher = sstr(bw["docno"], 12)
+            voudat  = parse_date(bw.get("date"))
+            descrp  = sstr(bw.get("desc", ""), 50)
+            amount  = float(bw.get("amount", 0))
+            bank    = sstr(bw.get("bank", "S1"), 2)
+            cr_acct = bw.get("cr_acct") or BANK_ACCT_MAP.get(bank, "1113-01")
+            hmap = {"JNLTYP":"00","BATCH":"","VOUDAT":voudat,"VOUCHER":voucher,"REFNUM":voucher,"SRCJNL":"GL","DESCRP":descrp,"REVERSE":" ","TRNSTAT":"P","DOCSTAT":"N","CREDAT":today,"CHGDAT":today}
+            th.append(mk(hdr_fields, hmap))
+            td.append(mk(dtl_fields, {"VOUCHER":voucher,"SEQIT":"01","VOUDAT":voudat,"ACCNUM":sstr(DEBIT_ACCT_BW,15),"DESCRP":descrp,"TRNTYP":"0","AMOUNT":amount,"CHGDAT":today}))
+            td.append(mk(dtl_fields, {"VOUCHER":voucher,"SEQIT":"02","VOUDAT":voudat,"ACCNUM":sstr(cr_acct,15),"DESCRP":descrp,"TRNTYP":"1","AMOUNT":amount,"CHGDAT":today}))
+            bmap = {"BKTRNTYP":"BW","TRNDAT":voudat,"CHQNUM":voucher,"CHQDAT":voudat,"BNKACC":bank,"AMOUNT":amount,"NETAMT":amount,"VATAMT":0.0,"CHARGE":0.0,"REMAMT":0.0,"REMCUT":0.0,"JNLTRNTYP":"1","REMARK":descrp,"VOUCHER":voucher,"USERID":"RPA","CHGDAT":today}
+            tb.append(mk(bktrn_fields, bmap))
+            ok += 1
+        except Exception as e:
+            logger.error(f"  ERR BW {bw.get('docno')}: {e}")
+            err += 1
+    th.close(); td.close(); tb.close()
+    return ok, err
+
+
+# ── AR: IN (ใหม่) ────────────────────────────────────────────
+
+def update_in_remamt(docnum, rcvamt):
+    """หัก REMAMT ของ IN หลังรับชำระ และอัปเดต RCVAMT + DOCSTAT"""
+    path = os.path.join(DBF_FOLDER, "ARTRN.DBF")
+    try:
+        t = dbf.Table(path, codepage=ENCODING)
+        t.open(mode=dbf.READ_WRITE)
+        for rec in t:
+            if str(rec.DOCNUM).strip() == docnum and str(rec.RECTYP).strip() == "3":
+                old_rem  = float(rec.REMAMT or 0)
+                old_rcv  = float(rec.RCVAMT or 0)
+                new_rem  = max(old_rem - rcvamt, 0.0)
+                new_rcv  = old_rcv + rcvamt
+                docstat  = "Y" if new_rem <= 0 else "N"
+                with rec:
+                    rec.REMAMT  = new_rem
+                    rec.RCVAMT  = new_rcv
+                    rec.DOCSTAT = docstat
+                break
+        t.close()
+    except Exception as e:
+        logger.error(f"update_in_remamt {docnum}: {e}")
+
+
+def write_one_in(artrn_fields, stcrd_fields, gljnl_fields, gljnlit_fields,
+                 th, ts, tgl, tdl, inv):
+    """เขียน 1 IN record ลง ARTRN + STCRD + GLJNL + GLJNLIT"""
+    docnum  = sstr(inv["docnum"], 12)
+    docdat  = parse_date(inv.get("docdat"))
+    cuscod  = sstr(inv.get("cuscod", ""), 10)
+    youref   = sstr(inv.get("youref", ""), 30)
+    custname = sstr(inv.get("custname", ""), 50)
+    gl_desc  = sstr(f"ขายเชื่อให้  {custname}" if custname else f"ขายเชื่อให้  {cuscod}", 50)
+    flgvat  = str(inv.get("flgvat", "2"))
+    paytrm  = int(inv.get("paytrm", 0))
+    vatrat  = 7
+    items   = inv.get("items", [])
+    total_incl = sum(float(it.get("trnval", 0)) for it in items)
+
+    if flgvat == "2":          # รวม VAT → ถอย VAT ออก
+        amount_bf, vatamt, netamt = calc_vat(total_incl, vatrat)
+    elif flgvat == "1":        # แยก VAT → บวก VAT เพิ่ม
+        amount_bf = total_incl
+        vatamt = round(total_incl * vatrat / 100, 2)
+        netamt = total_incl + vatamt
+    else:                      # "0" = ไม่มี VAT
+        amount_bf = total_incl
+        vatamt = 0.0
+        netamt = total_incl
+
+    today = date.today()
+    hmap = {
+        "RECTYP":"3","DOCNUM":docnum,"DOCDAT":docdat,"POSTGL":" ",
+        "SONUM":" "*12,"CNTYP":" ","DEPCOD":" "*4,"FLGVAT":flgvat,
+        "SLMCOD":" "*10,"CUSCOD":cuscod,"SHIPTO":" "*10,"YOUREF":youref,
+        "AREACOD":" "*4,"PAYTRM":paytrm,"DUEDAT":docdat,"BILNUM":"~",
+        "NXTSEQ":" -1","AMOUNT":amount_bf,"DISC":" "*10,"DISCAMT":0.0,
+        "AFTDISC":amount_bf,"ADVNUM":"AI","ADVAMT":0.0,"TOTAL":amount_bf,
+        "AMTRAT0":0.0,"VATRAT":vatrat if flgvat != "0" else None,"VATAMT":vatamt,"NETAMT":netamt,
+        "NETVAL":netamt,"RCVAMT":0.0,"REMAMT":netamt,"COMAMT":0.0,
+        "CMPLAPP":"N","CMPLDAT":None,"DOCSTAT":"N","CSHRCV":0.0,
+        "CHQRCV":0.0,"INTRCV":0.0,"BEFTAX":0.0,"TAXRAT":None,
+        "TAXCOND":" ","TAX":0.0,"IVCAMT":0.0,"CHQPAS":0.0,
+        "VATDAT":None,"VATPRD":None,"VATLATE":" ","SRV_VATTYP":"2",
+        "DLVBY":"  ","RESERVE":None,"USERID":USERID,"CHGDAT":today,
+        "USERPRN":" "*8,"PRNDAT":None,"PRNCNT":None,"PRNTIM":" "*8,
+        "AUTHID":" "*8,"APPROVE":None,"BILLTO":" "*10,"ORGNUM":0,
+    }
+    th.append(mk(artrn_fields, hmap))
+
+    for i, it in enumerate(items, 1):
+        stkcod  = sstr(it.get("stkcod",""), 20)
+        stkdes  = sstr(it.get("stkdes",""), 50)
+        loccod  = sstr(it.get("loccod","01"), 4)
+        trnqty  = float(it.get("trnqty", 1))
+        tqucod  = sstr(it.get("tqucod","AA"), 2)
+        unitpr  = float(it.get("unitpr", 0))
+        discamt = float(it.get("discamt", 0))
+        trnval  = float(it.get("trnval", trnqty*unitpr-discamt))
+        dmap = {
+            "STKCOD":stkcod,"LOCCOD":loccod,"DOCNUM":docnum,
+            "SEQNUM":f"{i:>3}","DOCDAT":docdat,"RDOCNUM":" "*15,
+            "REFNUM":" "*15,"DEPCOD":" "*4,"POSOPR":"9","FREE":" ",
+            "VATCOD":" ","PEOPLE":cuscod,"SLMCOD":" "*10,"FLAG":" ",
+            "TRNQTY":trnqty,"TQUCOD":tqucod,"TFACTOR":1.0,"UNITPR":unitpr,
+            "DISC":" "*10,"DISCAMT":discamt,"TRNVAL":trnval,"PHYBAL":0.0,
+            "RETSTK":" ","XTRNQTY":0.0,"XUNITPR":0.0,"XTRNVAL":0.0,
+            "XSALVAL":0.0,"NETVAL":trnval,"MLOTNUM":" "*24,"MREMBAL":0.0,
+            "MREMVAL":0.0,"BALCHG":0.0,"VALCHG":0.0,"LOTBAL":0.0,
+            "LOTVAL":0.0,"LUNITPR":0.0,"PSTKCOD":" "*20,
+            "ACCNUMDR":" "*15,"ACCNUMCR":" "*15,"STKDES":stkdes,
+            "PACKING":" "*15,"JOBCOD":" "*6,"PHASE":" "*4,
+            "COSCOD":" "*4,"REIMBURSE":" ",
+        }
+        ts.append(mk(stcrd_fields, dmap))
+
+    # ── GLJNL header ──
+    tgl.append(mk(gljnl_fields, {
+        "JNLTYP":"03","BATCH":"","VOUDAT":docdat,"VOUCHER":docnum,
+        "REFNUM":docnum,"SRCJNL":"GL","DESCRP":gl_desc,
+        "REVERSE":" ","TRNSTAT":"P","DOCSTAT":"N",
+        "CREDAT":today,"CHGDAT":today,
+    }))
+
+    # ── GLJNLIT lines ──
+    # Dr. ลูกหนี้ (netamt รวม) — ใช้ stkdes ของรายการแรกเป็นคำอธิบาย
+    first_desc = gl_desc
+    tdl.append(mk(gljnlit_fields, {
+        "VOUCHER":docnum,"SEQIT":"01","VOUDAT":docdat,
+        "ACCNUM":sstr(AR_ACCT, 15),"DESCRP":first_desc,
+        "TRNTYP":"0","AMOUNT":netamt,"CHGDAT":today,
+    }))
+    # Cr. รายได้/บัญชีพัก ตาม STKCOD — ใช้ stkdes เป็นคำอธิบาย
+    for seq, it in enumerate(items, 2):
+        acct   = stkcod_to_gl(it.get("stkcod", ""))
+        trnval = float(it.get("trnval", 0))
+        desc   = sstr(f"ขายเชื่อให้ {custname}".strip(), 50)
+        tdl.append(mk(gljnlit_fields, {
+            "VOUCHER":docnum,"SEQIT":str(seq).zfill(2),"VOUDAT":docdat,
+            "ACCNUM":sstr(acct, 15),"DESCRP":desc,
+            "TRNTYP":"1","AMOUNT":trnval,"CHGDAT":today,
+        }))
+
+    # ── GLBAL: อัปเดตยอดสะสม ──
+    gl_entries = [(AR_ACCT, "0", netamt)]
+    for it in items:
+        gl_entries.append((stkcod_to_gl(it.get("stkcod","")), "1", float(it.get("trnval",0))))
+    update_glbal(gl_entries, docdat)
+
+    return netamt
+
+
+# ── AR: RE (v3 synced) ────────────────────────────────────────
+
+def write_one_re(artrn_fields, arrcpit_fields, arrcpcq_fields, bktrn_fields,
+                 gljnl_fields, gljnlit_fields,
+                 th, tp, tq, tb, tgl, tdl, rcp):
+    """เขียน 1 RE record ลง ARTRN + ARRCPIT + ARRCPCQ + BKTRN + GLJNL + GLJNLIT (v3)"""
+    rcpnum  = sstr(rcp["rcpnum"], 12)
+    rcpdat  = parse_date(rcp.get("rcpdat"))
+    cuscod  = sstr(rcp.get("cuscod",""), 10)
+    bnkcod  = sstr(rcp.get("bnkcod",""), 2) or "  "
+    paytyp  = str(rcp.get("paytyp","T")).upper()
+    chqnum  = sstr(rcp.get("chqnum",""), 15)
+    chqdat  = parse_date(rcp.get("chqdat")) if rcp.get("chqdat") else rcpdat
+    remark  = sstr(rcp.get("remark",""), 50)
+    whtamt  = float(rcp.get("whtamt",   0))
+    fee     = float(rcp.get("fee",      0))
+    suspend = float(rcp.get("suspend",  0))
+    items   = rcp.get("items", [])
+    total   = sum(float(it.get("rcvamt",0)) for it in items)
+    # ใช้ transfer จาก frontend ถ้ามี ไม่งั้นคำนวณจาก total-wht-fee-suspend
+    _tf     = float(rcp.get("transfer", 0))
+    net_tf  = _tf if _tf > 0 else max(total - whtamt - fee - suspend, 0.0)
+    today   = date.today()
+
+    hmap = {
+        "RECTYP"    :"9",
+        "DOCNUM"    :rcpnum,
+        "DOCDAT"    :rcpdat,
+        "POSTGL"    :" ",
+        "SONUM"     :" "*12,
+        "CNTYP"     :" ",
+        "DEPCOD"    :" "*4,
+        "FLGVAT"    :"2",
+        "SLMCOD"    :" "*10,
+        "CUSCOD"    :cuscod,
+        "SHIPTO"    :" "*10,
+        "YOUREF"    :remark[:30],
+        "AREACOD"   :" "*4,
+        "PAYTRM"    :None,
+        "DUEDAT"    :rcpdat,
+        "BILNUM"    :"~",
+        "NXTSEQ"    :"   ",
+        "AMOUNT"    :0.0,
+        "DISC"      :" "*10,
+        "DISCAMT"   :0.0,
+        "AFTDISC"   :0.0,
+        "ADVNUM"    :" "*12,
+        "ADVAMT"    :0.0,
+        "TOTAL"     :0.0,
+        "AMTRAT0"   :total,
+        "VATRAT"    :None,
+        "VATAMT"    :0.0,
+        "NETAMT"    :total,
+        "NETVAL"    :0.0,
+        "RCVAMT"    :0.0,
+        "REMAMT"    :0.0,
+        "COMAMT"    :0.0,
+        "CMPLAPP"   :"Y",
+        "CMPLDAT"   :rcpdat,
+        "DOCSTAT"   :"M",
+        "CSHRCV"    :total if paytyp == "E" else 0.0,
+        "CHQRCV"    :0.0   if paytyp == "E" else total,
+        "INTRCV"    :0.0,
+        "BEFTAX"    :0.0,
+        "TAXRAT"    :None,
+        "TAXCOND"   :" ",
+        "TAX"       :0.0,
+        "IVCAMT"    :total,
+        "CHQPAS"    :total,
+        "VATDAT"    :rcpdat,
+        "VATPRD"    :None,
+        "VATLATE"   :" ",
+        "SRV_VATTYP":"-",
+        "DLVBY"     :"  ",
+        "RESERVE"   :None,
+        "USERID"    :USERID,
+        "CHGDAT"    :today,
+        "USERPRN"   :" "*8,
+        "PRNDAT"    :None,
+        "PRNCNT"    :None,
+        "PRNTIM"    :" "*8,
+        "AUTHID"    :" "*8,
+        "APPROVE"   :None,
+        "BILLTO"    :" "*10,
+        "ORGNUM"    :0,
+    }
+    th.append(mk(artrn_fields, hmap))
+
+    trre = chqnum or f"TR{rcpnum}"
+    txre = f"TX{rcpnum}"
+    # T=โอน, C=เช็ก, E=สด(เงินสด) — เงินสดไม่มี BKTRN/ARRCPCQ
+    is_cash = (paytyp == "E")
+
+    # template bmap สำหรับ BKTRN (ใช้ร่วมกับ fee/suspend)
+    bmap_tmpl = {
+        "BKTRNTYP"  :"bR",   # Express ใช้ bR สำหรับโอน/เช็ค; เงินสดไม่มี BKTRN
+        "TRNDAT"    :rcpdat,
+        "CHQNUM"    :trre,
+        "CHQDAT"    :chqdat,
+        "BNKCOD"    :"  ",
+        "BRANCH"    :" "*22,
+        "CUSCOD"    :cuscod,
+        "NAME"      :" "*50,
+        "DEPCOD"    :" "*4,
+        "POSTGL"    :" ",
+        "GETDAT"    :rcpdat,
+        "PAYINDAT"  :None,
+        "AMOUNT"    :net_tf,
+        "CHARGE"    :0.0,
+        "VATAMT"    :0.0,
+        "NETAMT"    :net_tf,
+        "REMAMT"    :0.0,
+        "REMCUT"    :0.0,
+        "CMPLAPP"   :" ",
+        "CHQSTAT"   :"19",
+        "BNKACC"    :"  ",
+        "JNLTRNTYP" :" ",
+        "REMARK"    :remark[:50],
+        "REFDOC"    :rcpnum,
+        "REFNUM"    :trre[:15],
+        "VATDAT"    :rcpdat,
+        "VATPRD"    :date(rcpdat.year,rcpdat.month,1),
+        "VATLATE"   :" ",
+        "VATTYP"    :" ",
+        "VOUCHER"   :" "*12,
+        "USERID"    :USERID,
+        "CHGDAT"    :today,
+        "AUTHID"    :" "*8,
+        "APPROVE"   :None,
+        "TAXID"     :" "*15,
+        "ORGNUM"    :0,
+    }
+
+    # BKTRN: ยอดโอนจริง (ข้ามถ้าเงินสด)
+    if not is_cash:
+        tb.append(mk(bktrn_fields, bmap_tmpl))
+
+    # BKTRN: WHT (ถ้ามี)
+    if whtamt > 0:
+        bmap_wht = dict(bmap_tmpl)
+        bmap_wht.update({"CHQNUM":txre,"AMOUNT":whtamt,"NETAMT":whtamt,"REFNUM":txre[:15]})
+        tb.append(mk(bktrn_fields, bmap_wht))
+
+    # หมายเหตุ: fee และ suspend ไม่มี BKTRN — Express ใช้เฉพาะ ARRCPCQ
+
+    # ARRCPCQ — ยอดโอน (ข้ามถ้าเงินสด), WHT, fee (TFRE), suspend (99RE)
+    if not is_cash:
+        tq.append(mk(arrcpcq_fields, {"RCPNUM":rcpnum,"CHQNUM":trre,"RCVAMT":net_tf}))
+    if whtamt > 0:
+        tq.append(mk(arrcpcq_fields, {"RCPNUM":rcpnum,"CHQNUM":txre,"RCVAMT":whtamt}))
+    if fee > 0:
+        tq.append(mk(arrcpcq_fields, {"RCPNUM":rcpnum,"CHQNUM":f"TF{rcpnum}"[:12],"RCVAMT":fee}))
+    if suspend > 0:
+        tq.append(mk(arrcpcq_fields, {"RCPNUM":rcpnum,"CHQNUM":f"99{rcpnum}"[:12],"RCVAMT":suspend}))
+
+    # ARRCPIT + หัก REMAMT ของ IN
+    for it in items:
+        docnum = sstr(it.get("docnum",""), 12)
+        rcvamt = float(it.get("rcvamt", 0))
+        vatamt = float(it.get("vatamt", 0))
+        tp.append(mk(arrcpit_fields, {"RCPNUM":rcpnum,"DOCNUM":docnum,"RECTYP":"3","RCVAMT":rcvamt,"VATAMT":vatamt}))
+        if docnum and rcvamt > 0:
+            update_in_remamt(docnum, rcvamt)   # ตัดยอดลูกหนี้
+
+    # ── GL + GLBAL สำหรับ RE ──
+    cfg      = load_gl_config()
+    ar_acc   = get_ar_acct(cfg, cuscod)
+    bk_acc   = get_bank_acct(cfg, bnkcod)
+    wht_acc  = get_default(cfg, "WHT")
+    fee_acc  = get_default(cfg, "FEE")
+    sus_acc  = get_default(cfg, "SUSPEND")
+    # เงินสด: ใช้บัญชี CASH จาก config หรือ default 1111-00
+    cash_acc = get_default(cfg, "CASH") if "CASH" in cfg["default"] else "1111-00"
+
+    # Dr. บัญชีรับเงิน: เงินสด→cash_acc, โอน/เช็ค→bk_acc
+    recv_acc = cash_acc if is_cash else bk_acc
+    transfer = net_tf   # ยอดเงินรับจริง (โอนหรือเงินสด)
+    custname = sstr(rcp.get("custname","") or cuscod, 30)
+    gl_desc  = sstr(f"รับชำระหนี้  {custname}", 50)
+
+    # Cr. ลูกหนี้ = จำนวนเงิน (total rcvamt) ← ยอดตามบิล
+    cr_total = total   # ไม่ใช่ net_tf
+
+    # GLJNL header
+    if tgl is not None:
+        tgl.append(mk(gljnl_fields, {
+            "JNLTYP":"02","BATCH":"","VOUDAT":rcpdat,"VOUCHER":rcpnum,
+            "REFNUM":rcpnum,"SRCJNL":"GL","DESCRP":gl_desc,
+            "REVERSE":" ","TRNSTAT":"P","DOCSTAT":"N",
+            "CREDAT":today,"CHGDAT":today,
+        }))
+
+        seq = 1
+        gl_entries = []
+
+        # Dr. รับเงิน (บัญชีธนาคาร หรือ เงินสด)
+        if transfer > 0:
+            tdl.append(mk(gljnlit_fields, {"VOUCHER":rcpnum,"SEQIT":str(seq).zfill(2),"VOUDAT":rcpdat,"ACCNUM":sstr(recv_acc,15),"DESCRP":gl_desc,"TRNTYP":"0","AMOUNT":transfer,"CHGDAT":today}))
+            gl_entries.append((recv_acc,"0",transfer)); seq+=1
+
+        # Dr. WHT
+        if whtamt > 0:
+            tdl.append(mk(gljnlit_fields, {"VOUCHER":rcpnum,"SEQIT":str(seq).zfill(2),"VOUDAT":rcpdat,"ACCNUM":sstr(wht_acc,15),"DESCRP":"ภาษีหัก ณ ที่จ่าย","TRNTYP":"0","AMOUNT":whtamt,"CHGDAT":today}))
+            gl_entries.append((wht_acc,"0",whtamt)); seq+=1
+
+        # Dr. ค่าธรรมเนียม
+        if fee > 0:
+            tdl.append(mk(gljnlit_fields, {"VOUCHER":rcpnum,"SEQIT":str(seq).zfill(2),"VOUDAT":rcpdat,"ACCNUM":sstr(fee_acc,15),"DESCRP":"ค่าธรรมเนียมธนาคาร","TRNTYP":"0","AMOUNT":fee,"CHGDAT":today}))
+            gl_entries.append((fee_acc,"0",fee)); seq+=1
+
+        # Dr. บัญชีพัก
+        if suspend > 0:
+            tdl.append(mk(gljnlit_fields, {"VOUCHER":rcpnum,"SEQIT":str(seq).zfill(2),"VOUDAT":rcpdat,"ACCNUM":sstr(sus_acc,15),"DESCRP":"บัญชีพัก","TRNTYP":"0","AMOUNT":suspend,"CHGDAT":today}))
+            gl_entries.append((sus_acc,"0",suspend)); seq+=1
+
+        # Cr. ลูกหนี้ = จำนวนเงินรวมตามบิล (transfer+wht+fee+suspend)
+        tdl.append(mk(gljnlit_fields, {"VOUCHER":rcpnum,"SEQIT":str(seq).zfill(2),"VOUDAT":rcpdat,"ACCNUM":sstr(ar_acc,15),"DESCRP":gl_desc,"TRNTYP":"1","AMOUNT":cr_total,"CHGDAT":today}))
+        gl_entries.append((ar_acc,"1",cr_total))
+
+        # อัปเดต GLBAL
+        update_glbal(gl_entries, rcpdat)
+
+
+# ── GLBAL: อัปเดตยอดสะสมรายเดือน ─────────────────────────────
+
+def update_glbal(gl_entries, docdat):
+    """อัปเดต GLBAL.DBF ยอด DEBIT{m}/CREDIT{m} ตามเดือนของ docdat
+    gl_entries = list of (accnum, trntyp, amount)
+      trntyp '0' = debit, '1' = credit
+    """
+    glbal_path = os.path.join(DBF_FOLDER, "GLBAL.DBF")
+    if not os.path.exists(glbal_path):
+        logger.warning("GLBAL.DBF ไม่พบ — ข้าม")
+        return
+    try:
+        month = docdat.month   # 1-12
+        dr_field = f"DEBIT{month}"
+        cr_field = f"CREDIT{month}"
+
+        tb = dbf.Table(glbal_path, codepage=ENCODING)
+        tb.open(mode=dbf.READ_WRITE)
+        glbal_fields = list(tb.field_names)
+
+        # รวม amount ต่อ account
+        totals = {}   # accnum → (dr_total, cr_total)
+        for accnum, trntyp, amount in gl_entries:
+            accnum = accnum.strip()
+            if accnum not in totals:
+                totals[accnum] = [0.0, 0.0]
+            if trntyp == "0":
+                totals[accnum][0] += amount
+            else:
+                totals[accnum][1] += amount
+
+        # หา record ที่มีอยู่
+        found = {}
+        for rec in tb:
+            acc = str(rec.ACCNUM).strip()
+            if acc in totals:
+                found[acc] = rec
+
+        for accnum, (dr, cr) in totals.items():
+            if accnum in found:
+                rec = found[accnum]
+                with rec:
+                    if dr_field in glbal_fields and dr > 0:
+                        setattr(rec, dr_field, float(getattr(rec, dr_field) or 0) + dr)
+                    if cr_field in glbal_fields and cr > 0:
+                        setattr(rec, cr_field, float(getattr(rec, cr_field) or 0) + cr)
+            else:
+                # สร้าง record ใหม่
+                new_rec = {f: 0.0 for f in glbal_fields if f.startswith(("DEBIT","CREDIT","BEG"))}
+                new_rec["ACCNUM"] = accnum
+                new_rec["DEPCOD"] = "    "
+                new_rec["JOBCOD"] = "      "
+                new_rec["CALSTA"] = " " * 24
+                if dr > 0 and dr_field in glbal_fields:
+                    new_rec[dr_field] = dr
+                if cr > 0 and cr_field in glbal_fields:
+                    new_rec[cr_field] = cr
+                tb.append(mk(glbal_fields, new_rec))
+            logger.info(f"  GLBAL {accnum}: DR{month}+={dr:.2f} CR{month}+={cr:.2f}")
+
+        tb.close()
+    except Exception as e:
+        logger.error(f"update_glbal error: {e}")
+
+
+# ── Routes ───────────────────────────────────────────────────
+
+@app.route('/import', methods=['POST'])
+def do_import():
+    try:
+        data  = request.json
+        jtype = data.get("type","PV")
+        rows  = data.get("data", [])
+        logger.info(f"\n[Agent] นำเข้า {jtype} {len(rows)} รายการ")
+        if jtype == "BW":
+            ok, err = write_bw_records(rows)
+        else:
+            ok, err = write_gl_records(rows, JNLTYP_MAP.get(jtype,"05"))
+        return jsonify({"success":ok,"error":err})
+    except Exception as e:
+        return jsonify({"error":str(e)}), 500
+
+
+@app.route('/import/in', methods=['POST'])
+def do_import_in():
+    """รับ JSON: { invoices: [ {docnum, docdat, cuscod, flgvat, paytrm, youref, items:[...]} ] }"""
+    try:
+        data     = request.json
+        invoices = data.get("invoices", [])
+        logger.info(f"\n[Agent] นำเข้า IN {len(invoices)} ใบ")
+
+        artrn_path  = os.path.join(DBF_FOLDER, "ARTRN.DBF")
+        stcrd_path  = os.path.join(DBF_FOLDER, "STCRD.DBF")
+        gljnl_path  = os.path.join(DBF_FOLDER, "GLJNL.DBF")
+        gljnlit_path= os.path.join(DBF_FOLDER, "GLJNLIT.DBF")
+        artrn_f  = get_fields(artrn_path)
+        stcrd_f  = get_fields(stcrd_path)
+        gljnl_f  = get_fields(gljnl_path)
+        gljnlit_f= get_fields(gljnlit_path)
+        th  = dbf.Table(artrn_path,   codepage=ENCODING); th.open(mode=dbf.READ_WRITE)
+        ts  = dbf.Table(stcrd_path,   codepage=ENCODING); ts.open(mode=dbf.READ_WRITE)
+        tgl = dbf.Table(gljnl_path,   codepage=ENCODING); tgl.open(mode=dbf.READ_WRITE)
+        tdl = dbf.Table(gljnlit_path, codepage=ENCODING); tdl.open(mode=dbf.READ_WRITE)
+
+        ok = err = skip = 0
+        details = []
+        for inv in invoices:
+            docnum = sstr(inv.get("docnum",""), 12)
+            if check_dup_artrn(docnum):
+                skip += 1
+                details.append({"docnum":docnum,"status":"dup"})
+                continue
+            try:
+                netamt = write_one_in(artrn_f, stcrd_f, gljnl_f, gljnlit_f, th, ts, tgl, tdl, inv)
+                ok += 1
+                details.append({"docnum":docnum,"status":"ok","netamt":netamt})
+                logger.info(f"  OK {docnum}")
+            except Exception as e:
+                err += 1
+                details.append({"docnum":docnum,"status":"err","msg":str(e)})
+                logger.error(f"  ERR {docnum}: {e}")
+
+        th.close(); ts.close(); tgl.close(); tdl.close()
+        return jsonify({"success":ok,"skipped":skip,"error":err,"details":details})
+    except Exception as e:
+        logger.error(f"import/in error: {e}")
+        return jsonify({"error":str(e)}), 500
+
+
+@app.route('/import/re', methods=['POST'])
+def do_import_re():
+    """รับ JSON: { receipts: [ {rcpnum, rcpdat, cuscod, bnkcod, chqnum, chqdat, whtamt, remark, items:[{docnum,rcvamt,vatamt}]} ] }"""
+    try:
+        data     = request.json
+        receipts = data.get("receipts", [])
+        logger.info(f"\n[Agent] นำเข้า RE {len(receipts)} ใบ")
+
+        artrn_path   = os.path.join(DBF_FOLDER, "ARTRN.DBF")
+        arrcpit_path = os.path.join(DBF_FOLDER, "ARRCPIT.DBF")
+        arrcpcq_path = os.path.join(DBF_FOLDER, "ARRCPCQ.DBF")
+        bktrn_path   = os.path.join(DBF_FOLDER, "BKTRN.DBF")
+        artrn_f   = get_fields(artrn_path)
+        arrcpit_f = get_fields(arrcpit_path)
+        arrcpcq_f = get_fields(arrcpcq_path)
+        bktrn_f   = get_fields(bktrn_path)
+
+        gljnl_path   = os.path.join(DBF_FOLDER, "GLJNL.DBF")
+        gljnlit_path = os.path.join(DBF_FOLDER, "GLJNLIT.DBF")
+        gljnl_f      = get_fields(gljnl_path)
+        gljnlit_f    = get_fields(gljnlit_path)
+
+        th  = dbf.Table(artrn_path,   codepage=ENCODING); th.open(mode=dbf.READ_WRITE)
+        tp  = dbf.Table(arrcpit_path, codepage=ENCODING); tp.open(mode=dbf.READ_WRITE)
+        tq  = dbf.Table(arrcpcq_path, codepage=ENCODING); tq.open(mode=dbf.READ_WRITE)
+        tb  = dbf.Table(bktrn_path,   codepage=ENCODING); tb.open(mode=dbf.READ_WRITE)
+        tgl = dbf.Table(gljnl_path,   codepage=ENCODING); tgl.open(mode=dbf.READ_WRITE)
+        tdl = dbf.Table(gljnlit_path, codepage=ENCODING); tdl.open(mode=dbf.READ_WRITE)
+
+        ok = err = skip = 0
+        details = []
+        for rcp in receipts:
+            rcpnum = sstr(rcp.get("rcpnum",""), 12)
+            if check_dup_artrn(rcpnum, rectyp="9"):
+                skip += 1
+                details.append({"rcpnum":rcpnum,"status":"dup"})
+                continue
+            try:
+                write_one_re(artrn_f, arrcpit_f, arrcpcq_f, bktrn_f, gljnl_f, gljnlit_f,
+                             th, tp, tq, tb, tgl, tdl, rcp)
+                ok += 1
+                details.append({"rcpnum":rcpnum,"status":"ok"})
+                logger.info(f"  OK {rcpnum}")
+            except Exception as e:
+                err += 1
+                details.append({"rcpnum":rcpnum,"status":"err","msg":str(e)})
+                logger.error(f"  ERR {rcpnum}: {e}")
+
+        th.close(); tp.close(); tq.close(); tb.close(); tgl.close(); tdl.close()
+        return jsonify({"success":ok,"skipped":skip,"error":err,"details":details})
+    except Exception as e:
+        logger.error(f"import/re error: {e}")
+        return jsonify({"error":str(e)}), 500
+
+
+@app.route('/ar/open', methods=['GET'])
+def get_open_ar():
+    """ดึงรายการ IN ที่ยังค้างชำระ (REMAMT > 0)"""
+    try:
+        cuscod_filter = request.args.get("cuscod","")
+        artrn_path = os.path.join(DBF_FOLDER, "ARTRN.DBF")
+        cust_names = load_cust_names()
+        result = []
+        t = dbf.Table(artrn_path, codepage=ENCODING)
+        t.open(mode=dbf.READ_ONLY)
+        for rec in t:
+            if str(rec.RECTYP).strip() != "3": continue
+            remamt = float(rec.REMAMT or 0)
+            if remamt <= 0: continue
+            cuscod = str(rec.CUSCOD).strip()
+            if cuscod_filter and cuscod != cuscod_filter: continue
+            result.append({
+                "docnum"  : str(rec.DOCNUM).strip(),
+                "docdat"  : str(rec.DOCDAT),
+                "cuscod"  : cuscod,
+                "cusname" : cust_names.get(cuscod, ""),
+                "netamt"  : float(rec.NETAMT or 0),
+                "rcvamt"  : float(rec.RCVAMT or 0),
+                "remamt"  : remamt,
+            })
+        t.close()
+        result.sort(key=lambda x: x["docdat"])
+        return jsonify({"invoices": result})
+    except Exception as e:
+        return jsonify({"error":str(e)}), 500
+
+
+@app.route('/set-path', methods=['POST'])
+def set_path():
+    """เปลี่ยน DBF_FOLDER แบบ dynamic จากหน้าเว็บ"""
+    global DBF_FOLDER
+    try:
+        data = request.json
+        new_path = data.get("dbf_path", "").strip()
+        if not new_path:
+            return jsonify({"error": "dbf_path ว่างเปล่า"}), 400
+        if not os.path.exists(new_path):
+            return jsonify({"error": f"ไม่พบ path: {new_path}"}), 400
+        DBF_FOLDER = new_path
+        logger.info(f"[Agent] เปลี่ยน DBF_FOLDER → {DBF_FOLDER}")
+        return jsonify({"success": True, "dbf_folder": DBF_FOLDER})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/status', methods=['GET'])
+def status():
+    dbf_ok = os.path.exists(os.path.join(DBF_FOLDER, "GLJNL.DBF"))
+    ar_ok  = os.path.exists(os.path.join(DBF_FOLDER, "ARTRN.DBF"))
+    return jsonify({"status":"online","dbf_folder":DBF_FOLDER,"dbf_ok":dbf_ok,"ar_ok":ar_ok,"version":"2.0.0"})
+
+@app.route('/ping', methods=['GET'])
+def ping():
+    return jsonify({"pong": True})
+
+
+# เพิ่ม route นำเข้า IN จาก Excel (/import-in, /inspect-in)
+register_in_routes(app)
+
+if __name__ == '__main__':
+    logger.info("JW RPA Agent v2.0.0")
+    logger.info(f"DBF Folder: {DBF_FOLDER}")
+    logger.info(f"Port: {PORT}")
+    app.run(host='127.0.0.1', port=PORT, debug=False)

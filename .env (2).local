@@ -1,0 +1,10 @@
+DATABASE_URL="postgresql://postgres:Wongsa793131@db.hklwbvpasiukjxvrrkxb.supabase.co:5432/postgres"
+
+NEXTAUTH_SECRET="jw-rpa-secret-key-2569"
+
+NEXTAUTH_URL="http://localhost:3000"
+
+AGENT_URL="http://localhost:9999"
+NEXT_PUBLIC_SUPABASE_URL=https://hklwbvpasiukjxvrrkxb.supabase.co
+NEXT_PUBLIC_SUPABASE_ANON_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImhrbHdidnBhc2l1a2p4dnJya3hiIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzQ4MDQyOTcsImV4cCI6MjA5MDM4MDI5N30.EQGlDfMs6HH3PwQ__Oo-Kc8Lzf47gSABUe90ttQWSGg
+SUPABASE_SERVICE_ROLE_KEY=sb_secret_l9w5h...

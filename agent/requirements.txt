@@ -1,0 +1,17 @@
+# agent/requirements.txt
+flask>=3.0.0
+dbf>=0.99.0
+
+# วิธีติดตั้งและ build
+# ติดตั้ง:
+#   pip install -r requirements.txt
+#
+# รันแบบ dev:
+#   python agent.py
+#
+# Build เป็น .exe (ส่งให้ลูกค้า):
+#   pip install pyinstaller
+#   pyinstaller --onefile --name "JW-RPA-Agent" agent.py
+#
+# ผลลัพธ์: dist/JW-RPA-Agent.exe
+# ลูกค้าดับเบิ้ลคลิกรันแล้วทิ้งไว้ใน system tray
