@@ -14,8 +14,10 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: 'กรุณาเข้าสู่ระบบ' }, { status: 401 })
     }
 
+    const userId = session.user.id ?? ''
+
     // ตรวจ License อีกครั้งก่อน import จริง
-    const license = await checkLicense(session.user.id)
+    const license = await checkLicense(userId)
     if (!license.valid) {
       return NextResponse.json({ error: `License: ${license.reason}` }, { status: 403 })
     }
@@ -50,7 +52,7 @@ export async function POST(req: NextRequest) {
     // บันทึก History
     await prisma.importHistory.create({
       data: {
-        userId:      session.user.id,
+        userId,
         type,
         fileName:    file.name,
         sheetName:   sheet,
@@ -63,7 +65,7 @@ export async function POST(req: NextRequest) {
     })
 
     // เพิ่ม usage count
-    await incrementImportCount(session.user.id)
+    await incrementImportCount(userId)
 
     return NextResponse.json({ success: successRows, error: errorRows })
 
