@@ -116,7 +116,7 @@ export default function RePage() {
     });
     try {
       const res = await importRE(receipts);
-      setResult({ success: res.success, skipped: res.skipped ?? 0, errors: res.error ?? 0, details: res.details });
+      setResult({ success: res.success, skipped: res.skipped ?? 0, errors: res.error ?? 0, details: res.details.map(d => ({ ...d, rcpnum: d.rcpnum ?? "", docnum: d.docnum ?? "" })) });
       setStep("done");
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : "เกิดข้อผิดพลาด"); setStep("match");
