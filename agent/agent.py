@@ -1171,16 +1171,17 @@ def delete_validate():
 
         results = []
 
-        if doctype == "IN":
+        if doctype in ("IN", "RE"):
             artrn_path = os.path.join(DBF_FOLDER, "ARTRN.DBF")
             cust_names = load_cust_names()
+            rectyp_filter = "3" if doctype == "IN" else "9"
             found = {}
             t = dbf.Table(artrn_path, codepage=ENCODING)
             t.open(mode=dbf.READ_ONLY)
             for rec in t:
                 if dbf.is_deleted(rec): continue
                 dn = str(rec.DOCNUM).strip()
-                if dn in docnums and str(rec.RECTYP).strip() == "3":
+                if dn in docnums and str(rec.RECTYP).strip() == rectyp_filter:
                     cuscod = str(rec.CUSCOD).strip()
                     found[dn] = {
                         "docnum":  dn,
@@ -1195,8 +1196,7 @@ def delete_validate():
             for dn in docnums:
                 if dn in found:
                     info = found[dn]
-                    # แจ้งเตือนถ้าชำระครบแล้ว (ลบได้แต่ระวัง)
-                    if info["docstat"] == "Y":
+                    if doctype == "IN" and info["docstat"] == "Y":
                         info["status"]  = "warn"
                         info["message"] = "ชำระครบแล้ว"
                     results.append(info)
@@ -1262,7 +1262,79 @@ def do_delete():
 
         deleted = set()
 
-        if doctype == "IN":
+        if doctype == "RE":
+            artrn_path   = os.path.join(DBF_FOLDER, "ARTRN.DBF")
+            arrcpit_path = os.path.join(DBF_FOLDER, "ARRCPIT.DBF")
+            arrcpcq_path = os.path.join(DBF_FOLDER, "ARRCPCQ.DBF")
+            bktrn_path   = os.path.join(DBF_FOLDER, "BKTRN.DBF")
+            gljnl_path   = os.path.join(DBF_FOLDER, "GLJNL.DBF")
+            gljnlit_path = os.path.join(DBF_FOLDER, "GLJNLIT.DBF")
+
+            # 1) ลบ ARTRN (RECTYP=9 = RE header)
+            t = dbf.Table(artrn_path, codepage=ENCODING)
+            t.open(mode=dbf.READ_WRITE)
+            for rec in t:
+                if dbf.is_deleted(rec): continue
+                dn = str(rec.DOCNUM).strip()
+                if dn in docnums and str(rec.RECTYP).strip() == "9":
+                    dbf.delete(rec)
+                    deleted.add(dn)
+                    logger.info(f"  DEL ARTRN(RE) {dn}")
+            t.close()
+
+            # 2) ลบ ARRCPIT (matching items)
+            if os.path.exists(arrcpit_path):
+                t = dbf.Table(arrcpit_path, codepage=ENCODING)
+                t.open(mode=dbf.READ_WRITE)
+                for rec in t:
+                    if dbf.is_deleted(rec): continue
+                    if str(rec.RCPNUM).strip() in deleted:
+                        dbf.delete(rec)
+                t.close()
+
+            # 3) ลบ ARRCPCQ (payment methods)
+            if os.path.exists(arrcpcq_path):
+                t = dbf.Table(arrcpcq_path, codepage=ENCODING)
+                t.open(mode=dbf.READ_WRITE)
+                for rec in t:
+                    if dbf.is_deleted(rec): continue
+                    if str(rec.RCPNUM).strip() in deleted:
+                        dbf.delete(rec)
+                t.close()
+
+            # 4) ลบ BKTRN
+            if os.path.exists(bktrn_path):
+                t = dbf.Table(bktrn_path, codepage=ENCODING)
+                t.open(mode=dbf.READ_WRITE)
+                for rec in t:
+                    if dbf.is_deleted(rec): continue
+                    voucher = str(getattr(rec, "VOUCHER", "") or "").strip()
+                    if voucher in deleted:
+                        dbf.delete(rec)
+                t.close()
+
+            # 5) ลบ GLJNL + GLJNLIT
+            if os.path.exists(gljnl_path):
+                t = dbf.Table(gljnl_path, codepage=ENCODING)
+                t.open(mode=dbf.READ_WRITE)
+                for rec in t:
+                    if dbf.is_deleted(rec): continue
+                    if str(rec.VOUCHER).strip() in deleted:
+                        dbf.delete(rec)
+                t.close()
+            if os.path.exists(gljnlit_path):
+                t = dbf.Table(gljnlit_path, codepage=ENCODING)
+                t.open(mode=dbf.READ_WRITE)
+                for rec in t:
+                    if dbf.is_deleted(rec): continue
+                    if str(rec.VOUCHER).strip() in deleted:
+                        dbf.delete(rec)
+                t.close()
+
+            log_usage(module="ลบรายการ — RE", count=len(deleted),
+                      status="success" if len(deleted) == len(docnums) else "error")
+
+        elif doctype == "IN":
             artrn_path   = os.path.join(DBF_FOLDER, "ARTRN.DBF")
             stcrd_path   = os.path.join(DBF_FOLDER, "STCRD.DBF")
             gljnl_path   = os.path.join(DBF_FOLDER, "GLJNL.DBF")

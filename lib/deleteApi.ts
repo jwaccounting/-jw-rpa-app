@@ -3,13 +3,7 @@
  * วางไว้ที่: E:\jw-rpa-app\lib\deleteApi.ts
  */
 
-const getAgentUrl = () => {
-  try {
-    const s = localStorage.getItem("jw-rpa-settings");
-    if (s) return JSON.parse(s)?.state?.agentUrl ?? "http://localhost:9999";
-  } catch {}
-  return "http://localhost:9999";
-};
+const getAgentUrl = () => "http://localhost:9999";
 
 // ─── Types ────────────────────────────────────────────────────
 

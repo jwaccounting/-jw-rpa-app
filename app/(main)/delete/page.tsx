@@ -50,6 +50,7 @@ export default function DeletePage() {
   const [file,      setFile]      = useState<File | null>(null);
   const [dragging,  setDragging]  = useState(false);
   const [rows,      setRows]      = useState<DeletePreviewRow[]>([]);
+  const [doctype,   setDoctype]   = useState<string>("IN");
   const [validated, setValidated] = useState<DeleteValidateRow[]>([]);
   const [selected,  setSelected]  = useState<string[]>([]);
   const [step,      setStep]      = useState<Step>("upload");
@@ -57,15 +58,14 @@ export default function DeletePage() {
   const [error,     setError]     = useState<string | null>(null);
   const [result,    setResult]    = useState<{ deleted: number; errors: number } | null>(null);
 
-  // doctype จาก rows (ใช้ตัวแรก — สมมติ batch เดียวกัน)
-  const doctype = rows[0]?.doctype ?? "IN";
-
   const handleFile = useCallback(async (f: File) => {
     setFile(f); setError(null); setLoading(true);
     try {
       const preview = await parseDeleteExcel(f);
       if (preview.length === 0) throw new Error("ไม่พบรายการในไฟล์ Excel");
+      const dt = (preview[0]?.doctype ?? "IN").toUpperCase();
       setRows(preview);
+      setDoctype(dt);
       setStep("preview");
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : "เกิดข้อผิดพลาดในการอ่านไฟล์");
@@ -80,7 +80,6 @@ export default function DeletePage() {
       const docnums = rows.map(r => r.docNo);
       const results = await validateDelete(doctype, docnums);
       setValidated(results);
-      // เลือกเฉพาะที่ ok/warn (ไม่รวม error)
       setSelected(results.filter(r => r.status !== "error").map(r => r.docnum));
       setStep("validated");
     } catch (e: unknown) {
@@ -91,9 +90,10 @@ export default function DeletePage() {
 
   const toggleRow = (docnum: string) =>
     setSelected(p => p.includes(docnum) ? p.filter(x => x !== docnum) : [...p, docnum]);
+
   const toggleAll = () => {
-    const selectable = validated.filter(r => r.status !== "error").map(r => r.docnum);
-    setSelected(selected.length === selectable.length ? [] : selectable);
+    const all = validated.filter(r => r.status !== "error").map(r => r.docnum);
+    setSelected(selected.length === all.length ? [] : all);
   };
 
   const handleDelete = async () => {
@@ -110,7 +110,7 @@ export default function DeletePage() {
 
   const reset = () => {
     setFile(null); setRows([]); setValidated([]); setSelected([]);
-    setStep("upload"); setError(null); setResult(null);
+    setDoctype("IN"); setStep("upload"); setError(null); setResult(null);
   };
 
   const selectable = validated.filter(r => r.status !== "error");
@@ -146,8 +146,9 @@ export default function DeletePage() {
               onClick={() => fileRef.current?.click()}
               onDragOver={(e) => { e.preventDefault(); setDragging(true); }}
               onDragLeave={() => setDragging(false)}
-              onDrop={(e) => { e.preventDefault(); setDragging(false); const f = e.dataTransfer.files[0]; if (f) handleFile(f); }}
-              style={{ border: `1.5px dashed ${dragging ? "#DC2626" : "#FECACA"}`, borderRadius: 10, padding: "40px 24px", textAlign: "center", cursor: "pointer", background: dragging ? "#FEF2F2" : "#FFF5F5", transition: "all 0.2s" }}>
+              onDrop={(e) => { e.preventDefault(); setDragging(false); const f = e.dataTransfer.files?.[0]; if (f) handleFile(f); }}
+              style={{ border: `2px dashed ${dragging ? "#3B82F6" : "#E5E7EB"}`, borderRadius: 10, padding: "32px 16px", textAlign: "center", cursor: "pointer", background: dragging ? "#EFF6FF" : "#FAFAFA", transition: "all 0.15s" }}
+            >
               <input ref={fileRef} type="file" accept=".xlsx,.xlsm" style={{ display: "none" }}
                 onChange={(e) => { const f = e.target.files?.[0]; if (f) handleFile(f); }} />
               {loading ? (
@@ -157,13 +158,13 @@ export default function DeletePage() {
               )}
             </div>
             <div style={{ marginTop: 12, fontSize: 12, color: "#9CA3AF", lineHeight: 1.8 }}>
-              💡 ไฟล์ต้องมีคอลัมน์ <strong>เลขที่เอกสาร</strong> และ <strong>ประเภท</strong> (เช่น IN, PV, RV, BW)
+              💡 ไฟล์ต้องมีคอลัมน์ <strong>เลขที่เอกสาร</strong> และ <strong>ประเภท</strong> (เช่น IN, PV, RV, BW, RE)
             </div>
           </div>
         </>
       )}
 
-      {/* Preview — อ่านจาก Excel แล้ว รอกด ตรวจสอบ */}
+      {/* Preview */}
       {step === "preview" && (
         <>
           <div style={{ background: "#F0FDF4", border: "1px solid #BBF7D0", borderRadius: 10, padding: "12px 16px", marginBottom: 12 }}>
@@ -174,8 +175,6 @@ export default function DeletePage() {
               <span onClick={reset} style={{ fontSize: 12, color: "#64748B", cursor: "pointer", textDecoration: "underline" }}>เปลี่ยน</span>
             </div>
           </div>
-
-          {/* รายการ Preview */}
           <div style={{ border: "1px solid #E5E7EB", borderRadius: 10, overflow: "hidden", marginBottom: 16 }}>
             <div style={{ padding: "8px 16px", background: "#F9FAFB", fontSize: 12, fontWeight: 600, color: "#374151", display: "flex", gap: 12 }}>
               <span style={{ flex: "0 0 150px" }}>เลขที่เอกสาร</span>
@@ -188,26 +187,19 @@ export default function DeletePage() {
               </div>
             ))}
           </div>
-
           <div style={{ display: "flex", gap: 10 }}>
-            <button onClick={reset} style={{ flex: 1, padding: "11px", borderRadius: 8, border: "1px solid #E5E7EB", background: "#fff", color: "#6B7280", fontSize: 13, fontWeight: 600, cursor: "pointer", fontFamily: "inherit" }}>
-              ยกเลิก
-            </button>
-            <button onClick={handleValidate} style={{ flex: 2, padding: "11px", borderRadius: 8, border: "none", background: "#2563EB", color: "#fff", fontSize: 13, fontWeight: 700, cursor: "pointer", fontFamily: "inherit" }}>
-              🔍 ตรวจสอบรายการใน Express
-            </button>
+            <button onClick={reset} style={{ flex: 1, padding: "11px", borderRadius: 8, border: "1px solid #E5E7EB", background: "#fff", color: "#6B7280", fontSize: 13, fontWeight: 600, cursor: "pointer", fontFamily: "inherit" }}>ยกเลิก</button>
+            <button onClick={handleValidate} style={{ flex: 2, padding: "11px", borderRadius: 8, border: "none", background: "#2563EB", color: "#fff", fontSize: 13, fontWeight: 700, cursor: "pointer", fontFamily: "inherit" }}>🔍 ตรวจสอบรายการใน Express</button>
           </div>
         </>
       )}
 
       {/* Validating */}
       {step === "validating" && (
-        <div style={{ textAlign: "center", padding: "48px 0", color: "#6B7280", fontSize: 14 }}>
-          ⏳ กำลังตรวจสอบรายการใน Express...
-        </div>
+        <div style={{ textAlign: "center", padding: "48px 0", color: "#6B7280", fontSize: 14 }}>⏳ กำลังตรวจสอบรายการใน Express...</div>
       )}
 
-      {/* Validated — แสดงผลตรวจสอบ เลือกแล้วกดลบ */}
+      {/* Validated */}
       {(step === "validated" || step === "deleting") && validated.length > 0 && (
         <>
           <div style={{ background: "#F0FDF4", border: "1px solid #BBF7D0", borderRadius: 10, padding: "12px 16px", marginBottom: 12 }}>
@@ -218,12 +210,9 @@ export default function DeletePage() {
               <span onClick={reset} style={{ fontSize: 12, color: "#64748B", cursor: "pointer", textDecoration: "underline" }}>เปลี่ยน</span>
             </div>
           </div>
-
           <div style={{ background: "#FEF2F2", border: "1px solid #FECACA", borderRadius: 8, padding: "10px 14px", marginBottom: 12, fontSize: 12, color: "#991B1B", display: "flex", gap: 8 }}>
             <span>⚠️</span><span>ตรวจสอบรายการก่อนกดลบ — ติ๊กออกหากไม่ต้องการลบรายการนั้น</span>
           </div>
-
-          {/* Select all */}
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "8px 16px", background: "#F9FAFB", border: "1px solid #E5E7EB", borderRadius: "10px 10px 0 0" }}>
             <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer", fontSize: 12, fontWeight: 600, color: "#374151" }}>
               <input type="checkbox" checked={selected.length === selectable.length && selectable.length > 0} onChange={toggleAll} style={{ width: 14, height: 14, accentColor: "#DC2626" }} />
@@ -231,9 +220,7 @@ export default function DeletePage() {
             </label>
             <span style={{ fontSize: 12, fontWeight: 700, color: "#DC2626" }}>{selected.length}/{validated.length} รายการ</span>
           </div>
-
           <div style={{ border: "1px solid #E5E7EB", borderTop: "none", borderRadius: "0 0 10px 10px", overflow: "hidden", marginBottom: 16 }}>
-            {/* Header */}
             <div style={{ display: "flex", gap: 12, padding: "7px 16px", background: "#F3F4F6", fontSize: 11, fontWeight: 600, color: "#6B7280" }}>
               <span style={{ width: 24 }}></span>
               <span style={{ flex: "0 0 150px" }}>เลขที่เอกสาร</span>
@@ -244,12 +231,7 @@ export default function DeletePage() {
             </div>
             {validated.map((r) => (
               <div key={r.docnum} style={{ display: "flex", alignItems: "center", gap: 12, padding: "10px 16px", background: selected.includes(r.docnum) ? "#FFF5F5" : r.status === "error" ? "#F9FAFB" : "#fff", borderTop: "1px solid #F3F4F6", opacity: r.status === "error" ? 0.5 : 1 }}>
-                <input
-                  type="checkbox"
-                  checked={selected.includes(r.docnum)}
-                  disabled={r.status === "error"}
-                  onChange={() => toggleRow(r.docnum)}
-                  style={{ width: 14, height: 14, accentColor: "#DC2626", flexShrink: 0 }} />
+                <input type="checkbox" checked={selected.includes(r.docnum)} disabled={r.status === "error"} onChange={() => toggleRow(r.docnum)} style={{ width: 14, height: 14, accentColor: "#DC2626", flexShrink: 0 }} />
                 <span style={{ fontSize: 12, fontWeight: 600, color: "#2563EB", flex: "0 0 150px" }}>{r.docnum}</span>
                 <span style={{ fontSize: 12, color: "#374151", flex: "0 0 100px" }}>{r.cuscod || "—"}</span>
                 <span style={{ fontSize: 12, color: "#374151", flex: 1 }}>{r.cusname || "—"}</span>
@@ -265,11 +247,8 @@ export default function DeletePage() {
               </div>
             ))}
           </div>
-
           <div style={{ display: "flex", gap: 10 }}>
-            <button onClick={reset} style={{ flex: 1, padding: "11px", borderRadius: 8, border: "1px solid #E5E7EB", background: "#fff", color: "#6B7280", fontSize: 13, fontWeight: 600, cursor: "pointer", fontFamily: "inherit" }}>
-              ยกเลิก
-            </button>
+            <button onClick={reset} style={{ flex: 1, padding: "11px", borderRadius: 8, border: "1px solid #E5E7EB", background: "#fff", color: "#6B7280", fontSize: 13, fontWeight: 600, cursor: "pointer", fontFamily: "inherit" }}>ยกเลิก</button>
             <button
               disabled={selected.length === 0 || step === "deleting"}
               onClick={handleDelete}
@@ -286,7 +265,7 @@ export default function DeletePage() {
           <div style={{ fontSize: 40, marginBottom: 12 }}>✅</div>
           <div style={{ fontSize: 17, fontWeight: 700, color: "#15803D", marginBottom: 8 }}>ลบเรียบร้อยแล้ว</div>
           <div style={{ display: "flex", justifyContent: "center", gap: 20, fontSize: 13, color: "#6B7280", marginBottom: 28 }}>
-            <span>✓ ลบสำเร็จ <strong style={{ color: "#15803D" }}>{result.deleted}</strong></span>
+            <span>✓ ลบสำเร็จ <strong style={{ color: "#15803D" }}>{result.deleted}</strong> รายการ</span>
             {result.errors > 0 && <span>✕ ผิดพลาด <strong style={{ color: "#DC2626" }}>{result.errors}</strong></span>}
           </div>
           <button onClick={reset} style={{ padding: "10px 28px", borderRadius: 8, border: "none", background: "#DC2626", color: "#fff", fontSize: 13, fontWeight: 700, cursor: "pointer", fontFamily: "inherit" }}>
