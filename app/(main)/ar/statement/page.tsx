@@ -75,9 +75,9 @@ function genRcpnum(date: string, idx: number): string {
   if (parts.length === 3) {
     const yy = parts[2].slice(-2);
     const mm = parts[1].padStart(2, "0");
-    return `ST${yy}${mm}${String(idx + 1).padStart(3, "0")}`;
+    return `RE${yy}${mm}${String(idx + 1).padStart(3, "0")}`;
   }
-  return `ST${String(idx + 1).padStart(8, "0")}`;
+  return `RE${String(idx + 1).padStart(8, "0")}`;
 }
 
 const fmt = (n: number) => n.toLocaleString("th-TH", { minimumFractionDigits: 2 });
