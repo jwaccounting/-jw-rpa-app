@@ -1282,7 +1282,43 @@ def do_delete():
                     logger.info(f"  DEL ARTRN(RE) {dn}")
             t.close()
 
-            # 2) ลบ ARRCPIT (matching items)
+            # 2) อ่าน ARRCPIT ก่อนลบ — เพื่อคืน REMAMT กลับให้ IN
+            restore_map = {}   # docnum(IN) → rcvamt ที่ต้องคืน
+            if os.path.exists(arrcpit_path):
+                t = dbf.Table(arrcpit_path, codepage=ENCODING)
+                t.open(mode=dbf.READ_ONLY)
+                for rec in t:
+                    if dbf.is_deleted(rec): continue
+                    if str(rec.RCPNUM).strip() in deleted:
+                        in_doc = str(rec.DOCNUM).strip()
+                        amt    = float(rec.RCVAMT or 0)
+                        if in_doc:
+                            restore_map[in_doc] = restore_map.get(in_doc, 0.0) + amt
+                t.close()
+
+            # คืน REMAMT + RCVAMT กลับให้ ARTRN(IN)
+            if restore_map:
+                t = dbf.Table(artrn_path, codepage=ENCODING)
+                t.open(mode=dbf.READ_WRITE)
+                for rec in t:
+                    if dbf.is_deleted(rec): continue
+                    dn = str(rec.DOCNUM).strip()
+                    if dn in restore_map and str(rec.RECTYP).strip() == "3":
+                        restore_amt = restore_map[dn]
+                        old_rem = float(rec.REMAMT or 0)
+                        old_rcv = float(rec.RCVAMT or 0)
+                        new_rem = old_rem + restore_amt
+                        new_rcv = max(old_rcv - restore_amt, 0.0)
+                        netamt  = float(rec.NETAMT or 0)
+                        docstat = "Y" if new_rem <= 0 else ("N" if new_rem >= netamt else "N")
+                        with rec:
+                            rec.REMAMT  = new_rem
+                            rec.RCVAMT  = new_rcv
+                            rec.DOCSTAT = docstat
+                        logger.info(f"  RESTORE IN {dn}: REMAMT {old_rem:.2f} → {new_rem:.2f}")
+                t.close()
+
+            # 3) ลบ ARRCPIT (matching items)
             if os.path.exists(arrcpit_path):
                 t = dbf.Table(arrcpit_path, codepage=ENCODING)
                 t.open(mode=dbf.READ_WRITE)
@@ -1292,7 +1328,7 @@ def do_delete():
                         dbf.delete(rec)
                 t.close()
 
-            # 3) ลบ ARRCPCQ (payment methods)
+            # 4) ลบ ARRCPCQ (payment methods)
             if os.path.exists(arrcpcq_path):
                 t = dbf.Table(arrcpcq_path, codepage=ENCODING)
                 t.open(mode=dbf.READ_WRITE)
@@ -1302,7 +1338,7 @@ def do_delete():
                         dbf.delete(rec)
                 t.close()
 
-            # 4) ลบ BKTRN
+            # 5) ลบ BKTRN
             if os.path.exists(bktrn_path):
                 t = dbf.Table(bktrn_path, codepage=ENCODING)
                 t.open(mode=dbf.READ_WRITE)
@@ -1313,7 +1349,7 @@ def do_delete():
                         dbf.delete(rec)
                 t.close()
 
-            # 5) ลบ GLJNL + GLJNLIT
+            # 6) ลบ GLJNL + GLJNLIT
             if os.path.exists(gljnl_path):
                 t = dbf.Table(gljnl_path, codepage=ENCODING)
                 t.open(mode=dbf.READ_WRITE)
