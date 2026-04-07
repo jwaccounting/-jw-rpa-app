@@ -15,20 +15,116 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 import dbf
 import os
+import json
+import configparser
 from datetime import date, datetime
 from decimal import Decimal, ROUND_HALF_UP
 import logging
 from import_in import register_routes as register_in_routes
 
 app = Flask(__name__)
-CORS(app)   # เปิด CORS ให้ browser เรียกได้จาก localhost:3000
+CORS(app)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ============================================================
-DBF_FOLDER = r"Z:\jw-test"
+# อ่าน config.ini — ถ้าไม่มีใช้ค่า default
+CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.ini")
+
+def load_config():
+    cfg = configparser.ConfigParser()
+    cfg.read(CONFIG_FILE, encoding="utf-8")
+    return cfg.get("agent", "dbf_path", fallback=r"Z:\Aulgor")
+
+def save_config(dbf_path: str):
+    cfg = configparser.ConfigParser()
+    cfg["agent"] = {"dbf_path": dbf_path, "port": str(PORT)}
+    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+        cfg.write(f)
+
+DBF_FOLDER = load_config()
+# ============================================================
 ENCODING   = "cp874"
 PORT       = 9999
+
+HISTORY_FILE = os.path.join(os.path.dirname(__file__), "usage_history.json")
+PAYMENT_FILE = os.path.join(os.path.dirname(__file__), "payment_notify.json")
+MAX_HISTORY  = 100
+
+# ── Supabase config (สำหรับ auto-register) ────────────────────
+SUPABASE_URL      = "https://hklwbvpasiukjxvrrkxb.supabase.co"
+SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImhrbHdidnBhc2l1a2p4dnJya3hiIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzQ4MDQyOTcsImV4cCI6MjA5MDM4MDI5N30.EQGlDfMs6HH3PwQ__Oo-Kc8Lzf47gSABUe90ttQWSGg"
+
+def auto_register():
+    """ลงทะเบียนเครื่องใน Supabase ถ้ายังไม่มี — สถานะ 'pending'"""
+    try:
+        import requests as req
+        import platform
+        from license_checker import get_machine_id
+        machine_id = get_machine_id()
+        pc_name    = platform.node()
+        os_ver     = platform.version()
+        headers    = {
+            "apikey":        SUPABASE_ANON_KEY,
+            "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
+            "Content-Type":  "application/json",
+            "Prefer":        "resolution=ignore-duplicates",
+        }
+        # เช็คว่ามี record อยู่แล้วไหม
+        chk = req.get(
+            f"{SUPABASE_URL}/rest/v1/licenses?machine_id=eq.{machine_id}&select=id,is_active",
+            headers=headers, timeout=8
+        )
+        if chk.status_code == 200 and chk.json():
+            logger.info(f"[Register] เครื่องนี้ลงทะเบียนแล้ว")
+            return
+        # สร้าง record ใหม่ สถานะ pending (is_active=False)
+        payload = {
+            "machine_id":     machine_id,
+            "customer_name":  pc_name,
+            "plan":           "pending",
+            "is_active":      False,
+            "expire_date":    None,
+            "pc_name":        pc_name,
+            "os_version":     os_ver,
+        }
+        res = req.post(
+            f"{SUPABASE_URL}/rest/v1/licenses",
+            headers=headers, json=payload, timeout=8
+        )
+        if res.status_code in (200, 201):
+            logger.info(f"[Register] ลงทะเบียนเครื่องใหม่สำเร็จ: {pc_name} ({machine_id})")
+        else:
+            logger.warning(f"[Register] ลงทะเบียนไม่สำเร็จ: {res.text}")
+    except Exception as e:
+        logger.warning(f"[Register] error: {e}")   # เก็บสูงสุด 100 รายการ
+
+def log_usage(module: str, count: int, status: str, dbf_path: str = None, room: str = None):
+    """บันทึกประวัติการนำเข้าลงไฟล์ JSON"""
+    try:
+        history = []
+        if os.path.exists(HISTORY_FILE):
+            with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+                history = json.load(f)
+        path = dbf_path or DBF_FOLDER
+        # ชื่อห้องจาก path เช่น Z:\Aulgor → Aulgor
+        if not room:
+            room = os.path.basename(path.rstrip("\\/")) or path
+        entry = {
+            "id": int(datetime.now().timestamp() * 1000),
+            "module": module,
+            "count": count,
+            "room": room,
+            "dbf_path": path,
+            "status": status,
+            "created_at": datetime.now().isoformat(),
+        }
+        history.insert(0, entry)
+        history = history[:MAX_HISTORY]
+        with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(history, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.warning(f"log_usage error: {e}")
 
 JNLTYP_MAP = {
     "JV": "05", "PV": "01", "RV": "02",
@@ -696,6 +792,9 @@ def do_import():
             ok, err = write_bw_records(rows)
         else:
             ok, err = write_gl_records(rows, JNLTYP_MAP.get(jtype,"05"))
+        _jtype_names = {"JV":"ทั่วไป","PV":"จ่าย","RV":"รับ","SV":"ขาย","UV":"ซื้อ","BW":"ถอนเงิน"}
+        _jtype_label = jtype + " — " + _jtype_names.get(jtype, jtype)
+        log_usage(module=_jtype_label, count=ok, status="success" if err==0 else "error")
         return jsonify({"success":ok,"error":err})
     except Exception as e:
         return jsonify({"error":str(e)}), 500
@@ -741,6 +840,7 @@ def do_import_in():
                 logger.error(f"  ERR {docnum}: {e}")
 
         th.close(); ts.close(); tgl.close(); tdl.close()
+        log_usage(module="INV — ใบแจ้งหนี้", count=ok, status="success" if err==0 else "error")
         return jsonify({"success":ok,"skipped":skip,"error":err,"details":details})
     except Exception as e:
         logger.error(f"import/in error: {e}")
@@ -796,6 +896,7 @@ def do_import_re():
                 logger.error(f"  ERR {rcpnum}: {e}")
 
         th.close(); tp.close(); tq.close(); tb.close(); tgl.close(); tdl.close()
+        log_usage(module="RE — รับชำระหนี้", count=ok, status="success" if err==0 else "error")
         return jsonify({"success":ok,"skipped":skip,"error":err,"details":details})
     except Exception as e:
         logger.error(f"import/re error: {e}")
@@ -834,6 +935,129 @@ def get_open_ar():
         return jsonify({"error":str(e)}), 500
 
 
+@app.route('/browse-folder', methods=['GET'])
+def browse_folder():
+    """เปิด Windows folder picker dialog ผ่าน subprocess (thread-safe)"""
+    try:
+        import subprocess, sys, tempfile, json as _json
+
+        initial = DBF_FOLDER if os.path.exists(DBF_FOLDER) else "Z:\\"
+        # รัน tkinter dialog ใน subprocess แยกต่างหาก เพื่อหลีกเลี่ยงปัญหา
+        # "main thread is not in main loop" ของ tkinter ใน Flask worker thread
+        script = (
+            "import tkinter as tk; from tkinter import filedialog; import json, sys;"
+            f"root=tk.Tk(); root.withdraw(); root.lift(); root.attributes('-topmost',True);"
+            f"f=filedialog.askdirectory(title='เลือกโฟลเดอร์ที่เก็บข้อมูล DBF',initialdir={repr(initial)});"
+            "root.destroy();"
+            "print(json.dumps({'path': f.replace('/','\\\\\\\\') if f else ''}))"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True, text=True, timeout=120
+        )
+        if result.returncode != 0:
+            raise Exception(result.stderr.strip() or "subprocess failed")
+
+        out = result.stdout.strip()
+        if not out:
+            return jsonify({"success": False, "path": ""})
+        data = _json.loads(out)
+        path = data.get("path", "")
+        if path:
+            path = path.replace("/", "\\").rstrip("\\") + "\\"
+            return jsonify({"success": True, "path": path})
+        else:
+            return jsonify({"success": False, "path": ""})
+    except subprocess.TimeoutExpired:
+        return jsonify({"success": False, "path": "", "cancelled": True})
+    except Exception as e:
+        logger.error(f"browse-folder error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/list-drives', methods=['GET'])
+def list_drives():
+    """แสดงรายการ drive และ subfolder สำหรับ web-based folder browser"""
+    try:
+        req_path = request.args.get("path", "").strip()
+
+        # ── ถ้าไม่ส่ง path มา → list drives ทั้งหมด ──
+        if not req_path:
+            import string
+            drives = []
+            for letter in string.ascii_uppercase:
+                p = f"{letter}:\\"
+                if os.path.exists(p):
+                    drives.append({"name": p, "path": p, "type": "drive"})
+            return jsonify({"path": "", "items": drives, "has_dbf": False})
+
+        # ── normalize path ──
+        req_path = req_path.rstrip("\\/") + "\\"
+        if not os.path.isdir(req_path):
+            return jsonify({"error": f"ไม่พบ: {req_path}"}), 404
+
+        # ── list subfolder ──
+        items = []
+        try:
+            with os.scandir(req_path) as it:
+                for entry in it:
+                    if entry.is_dir(follow_symlinks=False):
+                        items.append({
+                            "name": entry.name,
+                            "path": os.path.join(req_path, entry.name) + "\\",
+                            "type": "folder",
+                        })
+        except PermissionError:
+            pass
+        items.sort(key=lambda x: x["name"].lower())
+
+        # ── ตรวจว่ามี DBF ไหม ──
+        has_dbf = any(
+            f.lower().endswith(".dbf")
+            for f in os.listdir(req_path)
+            if os.path.isfile(os.path.join(req_path, f))
+        )
+        gljnl_ok = os.path.exists(os.path.join(req_path, "GLJNL.DBF"))
+        artrn_ok = os.path.exists(os.path.join(req_path, "ARTRN.DBF"))
+
+        return jsonify({
+            "path": req_path,
+            "items": items,
+            "has_dbf": has_dbf,
+            "gljnl_ok": gljnl_ok,
+            "artrn_ok": artrn_ok,
+        })
+    except Exception as e:
+        logger.error(f"list-drives error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/validate-path', methods=['POST'])
+def validate_path():
+    """ตรวจสอบว่า path ที่ระบุมีไฟล์ DBF ของ Express หรือไม่"""
+    try:
+        data = request.json or {}
+        path = data.get("path", "").strip().rstrip("\\/") + "\\"
+        if not os.path.isdir(path):
+            return jsonify({"valid": False, "error": "ไม่พบโฟลเดอร์นี้"})
+        gljnl_ok = os.path.exists(os.path.join(path, "GLJNL.DBF"))
+        artrn_ok = os.path.exists(os.path.join(path, "ARTRN.DBF"))
+        has_dbf  = any(
+            f.lower().endswith(".dbf")
+            for f in os.listdir(path)
+            if os.path.isfile(os.path.join(path, f))
+        )
+        return jsonify({
+            "valid":    has_dbf,
+            "gljnl_ok": gljnl_ok,
+            "artrn_ok": artrn_ok,
+            "has_dbf":  has_dbf,
+            "path":     path,
+        })
+    except Exception as e:
+        return jsonify({"valid": False, "error": str(e)}), 500
+
+
 @app.route('/set-path', methods=['POST'])
 def set_path():
     """เปลี่ยน DBF_FOLDER แบบ dynamic จากหน้าเว็บ"""
@@ -843,9 +1067,10 @@ def set_path():
         new_path = data.get("dbf_path", "").strip()
         if not new_path:
             return jsonify({"error": "dbf_path ว่างเปล่า"}), 400
-        if not os.path.exists(new_path):
-            return jsonify({"error": f"ไม่พบ path: {new_path}"}), 400
+        # normalize — เติม backslash ท้ายถ้าไม่มี
+        new_path = new_path.rstrip("\\/") + "\\"
         DBF_FOLDER = new_path
+        save_config(DBF_FOLDER)
         logger.info(f"[Agent] เปลี่ยน DBF_FOLDER → {DBF_FOLDER}")
         return jsonify({"success": True, "dbf_folder": DBF_FOLDER})
     except Exception as e:
@@ -866,8 +1091,272 @@ def ping():
 # เพิ่ม route นำเข้า IN จาก Excel (/import-in, /inspect-in)
 register_in_routes(app)
 
+
+@app.route('/usage-history', methods=['GET'])
+def usage_history():
+    """ดึงประวัติการนำเข้าข้อมูล"""
+    try:
+        limit = int(request.args.get("limit", 20))
+        if os.path.exists(HISTORY_FILE):
+            with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+                history = json.load(f)
+        else:
+            history = []
+        return jsonify({"history": history[:limit]})
+    except Exception as e:
+        return jsonify({"history": [], "error": str(e)})
+
+
+@app.route('/license-info', methods=['GET'])
+def license_info():
+    """ดึงข้อมูล license จาก license_checker"""
+    try:
+        from license_checker import get_license_info
+        info = get_license_info()
+        return jsonify(info)
+    except Exception:
+        # fallback — ถ้า license_checker ไม่มี get_license_info ให้ return ข้อมูลพื้นฐาน
+        import uuid, platform
+        machine_id = str(uuid.getnode())
+        return jsonify({
+            "plan": "รายเดือน",
+            "machine_id": platform.node(),
+            "expire_date": "30 เม.ย. 2569",
+            "days_left": 24,
+            "status": "active",
+        })
+
+
+@app.route('/payment-notify', methods=['POST'])
+def payment_notify():
+    """รับการแจ้งชำระเงินจากหน้าเว็บ"""
+    try:
+        data = request.json or {}
+        record = {
+            "id": int(datetime.now().timestamp() * 1000),
+            "name": data.get("name", ""),
+            "amount": data.get("amount", ""),
+            "date": data.get("date", ""),
+            "created_at": datetime.now().isoformat(),
+            "status": "pending",
+        }
+        # บันทึกลงไฟล์
+        payments = []
+        if os.path.exists(PAYMENT_FILE):
+            with open(PAYMENT_FILE, "r", encoding="utf-8") as f:
+                payments = json.load(f)
+        payments.insert(0, record)
+        with open(PAYMENT_FILE, "w", encoding="utf-8") as f:
+            json.dump(payments, f, ensure_ascii=False, indent=2)
+        logger.info(f"[Payment] แจ้งชำระ: {record['name']} {record['amount']} บาท วันที่ {record['date']}")
+        return jsonify({"success": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# ── Delete Routes ─────────────────────────────────────────────
+
+@app.route('/delete/validate', methods=['POST'])
+def delete_validate():
+    """ตรวจสอบรายการก่อนลบ
+    รับ: { doctype: "IN"|"JV"|"PV"|..., docnums: ["IN6904001", ...] }
+    คืน: { results: [{docnum, cuscod, cusname, netamt, docstat, status, message}], ok, error }
+    """
+    try:
+        data    = request.json or {}
+        doctype = data.get("doctype", "IN").upper()
+        docnums = [str(d).strip() for d in data.get("docnums", [])]
+        if not docnums:
+            return jsonify({"results": [], "ok": 0, "error": 0})
+
+        results = []
+
+        if doctype == "IN":
+            artrn_path = os.path.join(DBF_FOLDER, "ARTRN.DBF")
+            cust_names = load_cust_names()
+            found = {}
+            t = dbf.Table(artrn_path, codepage=ENCODING)
+            t.open(mode=dbf.READ_ONLY)
+            for rec in t:
+                if dbf.is_deleted(rec): continue
+                dn = str(rec.DOCNUM).strip()
+                if dn in docnums and str(rec.RECTYP).strip() == "3":
+                    cuscod = str(rec.CUSCOD).strip()
+                    found[dn] = {
+                        "docnum":  dn,
+                        "cuscod":  cuscod,
+                        "cusname": cust_names.get(cuscod, ""),
+                        "netamt":  float(rec.NETAMT or 0),
+                        "docstat": str(rec.DOCSTAT).strip(),
+                        "status":  "ok",
+                        "message": "",
+                    }
+            t.close()
+            for dn in docnums:
+                if dn in found:
+                    info = found[dn]
+                    # แจ้งเตือนถ้าชำระครบแล้ว (ลบได้แต่ระวัง)
+                    if info["docstat"] == "Y":
+                        info["status"]  = "warn"
+                        info["message"] = "ชำระครบแล้ว"
+                    results.append(info)
+                else:
+                    results.append({
+                        "docnum": dn, "cuscod": "", "cusname": "",
+                        "netamt": 0, "docstat": "",
+                        "status": "error", "message": "ไม่พบเอกสาร",
+                    })
+
+        else:
+            # GL types: JV, PV, RV, SV, UV, BW
+            gljnl_path = os.path.join(DBF_FOLDER, "GLJNL.DBF")
+            found = {}
+            t = dbf.Table(gljnl_path, codepage=ENCODING)
+            t.open(mode=dbf.READ_ONLY)
+            for rec in t:
+                if dbf.is_deleted(rec): continue
+                vc = str(rec.VOUCHER).strip()
+                if vc in docnums:
+                    found[vc] = {
+                        "docnum":  vc,
+                        "cuscod":  "",
+                        "cusname": str(getattr(rec, "DESCRP", "") or "").strip(),
+                        "netamt":  0,
+                        "docstat": str(getattr(rec, "DOCSTAT", "") or "").strip(),
+                        "status":  "ok",
+                        "message": "",
+                    }
+            t.close()
+            for dn in docnums:
+                if dn in found:
+                    results.append(found[dn])
+                else:
+                    results.append({
+                        "docnum": dn, "cuscod": "", "cusname": "",
+                        "netamt": 0, "docstat": "",
+                        "status": "error", "message": "ไม่พบเอกสาร",
+                    })
+
+        ok_count  = sum(1 for r in results if r["status"] in ("ok", "warn"))
+        err_count = sum(1 for r in results if r["status"] == "error")
+        logger.info(f"[Validate] {doctype} ok={ok_count} err={err_count}")
+        return jsonify({"results": results, "ok": ok_count, "error": err_count})
+    except Exception as e:
+        logger.error(f"delete/validate error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/delete', methods=['POST'])
+def do_delete():
+    """ลบรายการออกจาก DBF (mark deleted)
+    รับ: { doctype: "IN"|"JV"|"PV"|..., docnums: ["IN6904001", ...] }
+    คืน: { success, error, details:[{docnum, status}] }
+    IN  → ลบ ARTRN + STCRD + GLJNL + GLJNLIT
+    GL  → ลบ GLJNL + GLJNLIT
+    """
+    try:
+        data    = request.json or {}
+        doctype = data.get("doctype", "IN").upper()
+        docnums = set(str(d).strip() for d in data.get("docnums", []))
+        logger.info(f"\n[Agent] ลบ {doctype} {len(docnums)} รายการ")
+
+        deleted = set()
+
+        if doctype == "IN":
+            artrn_path   = os.path.join(DBF_FOLDER, "ARTRN.DBF")
+            stcrd_path   = os.path.join(DBF_FOLDER, "STCRD.DBF")
+            gljnl_path   = os.path.join(DBF_FOLDER, "GLJNL.DBF")
+            gljnlit_path = os.path.join(DBF_FOLDER, "GLJNLIT.DBF")
+
+            # 1) ลบ ARTRN (RECTYP=3 = IN header)
+            t = dbf.Table(artrn_path, codepage=ENCODING)
+            t.open(mode=dbf.READ_WRITE)
+            for rec in t:
+                if dbf.is_deleted(rec): continue
+                dn = str(rec.DOCNUM).strip()
+                if dn in docnums and str(rec.RECTYP).strip() == "3":
+                    dbf.delete(rec)
+                    deleted.add(dn)
+                    logger.info(f"  DEL ARTRN {dn}")
+            t.close()
+
+            # 2) ลบ STCRD (line items)
+            if os.path.exists(stcrd_path):
+                t = dbf.Table(stcrd_path, codepage=ENCODING)
+                t.open(mode=dbf.READ_WRITE)
+                for rec in t:
+                    if dbf.is_deleted(rec): continue
+                    if str(rec.DOCNUM).strip() in deleted:
+                        dbf.delete(rec)
+                t.close()
+
+            # 3) ลบ GLJNL header
+            if os.path.exists(gljnl_path):
+                t = dbf.Table(gljnl_path, codepage=ENCODING)
+                t.open(mode=dbf.READ_WRITE)
+                for rec in t:
+                    if dbf.is_deleted(rec): continue
+                    if str(rec.VOUCHER).strip() in deleted:
+                        dbf.delete(rec)
+                t.close()
+
+            # 4) ลบ GLJNLIT line items
+            if os.path.exists(gljnlit_path):
+                t = dbf.Table(gljnlit_path, codepage=ENCODING)
+                t.open(mode=dbf.READ_WRITE)
+                for rec in t:
+                    if dbf.is_deleted(rec): continue
+                    if str(rec.VOUCHER).strip() in deleted:
+                        dbf.delete(rec)
+                t.close()
+
+            log_usage(module="ลบรายการ — IN", count=len(deleted),
+                      status="success" if len(deleted) == len(docnums) else "error")
+
+        else:
+            # GL types: JV, PV, RV, SV, UV, BW
+            gljnl_path   = os.path.join(DBF_FOLDER, "GLJNL.DBF")
+            gljnlit_path = os.path.join(DBF_FOLDER, "GLJNLIT.DBF")
+
+            t = dbf.Table(gljnl_path, codepage=ENCODING)
+            t.open(mode=dbf.READ_WRITE)
+            for rec in t:
+                if dbf.is_deleted(rec): continue
+                vc = str(rec.VOUCHER).strip()
+                if vc in docnums:
+                    dbf.delete(rec)
+                    deleted.add(vc)
+                    logger.info(f"  DEL GLJNL {vc}")
+            t.close()
+
+            if os.path.exists(gljnlit_path):
+                t = dbf.Table(gljnlit_path, codepage=ENCODING)
+                t.open(mode=dbf.READ_WRITE)
+                for rec in t:
+                    if dbf.is_deleted(rec): continue
+                    if str(rec.VOUCHER).strip() in deleted:
+                        dbf.delete(rec)
+                t.close()
+
+            log_usage(module=f"ลบรายการ — {doctype}", count=len(deleted),
+                      status="success" if len(deleted) == len(docnums) else "error")
+
+        details = [
+            {"docnum": dn, "status": "deleted" if dn in deleted else "not_found"}
+            for dn in docnums
+        ]
+        ok  = len(deleted)
+        err = len(docnums) - ok
+        logger.info(f"[Delete] สำเร็จ {ok}, ไม่พบ {err}")
+        return jsonify({"success": ok, "error": err, "details": details})
+    except Exception as e:
+        logger.error(f"delete error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
 if __name__ == '__main__':
     logger.info("JW RPA Agent v2.0.0")
     logger.info(f"DBF Folder: {DBF_FOLDER}")
     logger.info(f"Port: {PORT}")
+    auto_register()   # ลงทะเบียนเครื่องอัตโนมัติ
     app.run(host='127.0.0.1', port=PORT, debug=False)

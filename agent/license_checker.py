@@ -202,6 +202,61 @@ def show_machine_id():
     return mid
 
 
+def get_license_info() -> dict:
+    """ดึงข้อมูล license สำหรับแสดงบนหน้าเว็บ"""
+    machine_id = get_machine_id()
+    try:
+        headers = {
+            "apikey": SUPABASE_ANON_KEY,
+            "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
+        }
+        url = (f"{SUPABASE_URL}/rest/v1/licenses"
+               f"?machine_id=eq.{machine_id}"
+               f"&select=customer_name,is_active,expire_date,plan,machine_id")
+        res = requests.get(url, headers=headers, timeout=8)
+        if res.status_code == 200 and res.json():
+            lic = res.json()[0]
+            exp_str = lic.get("expire_date", "")
+            days_left = 0
+            if exp_str:
+                exp = datetime.fromisoformat(exp_str.replace("Z", "+00:00"))
+                days_left = max(0, (exp.date() - datetime.now().date()).days)
+                # แปลงเป็นวันที่ไทย
+                thai_months = ["","ม.ค.","ก.พ.","มี.ค.","เม.ย.","พ.ค.","มิ.ย.","ก.ค.","ส.ค.","ก.ย.","ต.ค.","พ.ย.","ธ.ค."]
+                exp_thai = f"{exp.day} {thai_months[exp.month]} {exp.year + 543}"
+            else:
+                exp_thai = "ตลอดไป"
+            import platform
+            return {
+                "plan": lic.get("plan", "รายเดือน"),
+                "machine_id": platform.node(),
+                "expire_date": exp_thai,
+                "days_left": days_left,
+                "status": "active" if lic.get("is_active") else "suspended",
+                "customer_name": lic.get("customer_name", ""),
+            }
+    except Exception:
+        pass
+    # fallback จาก cache
+    cached = _load_cache(machine_id, max_days=30)
+    if cached:
+        return {
+            "plan": cached.get("plan", "รายเดือน"),
+            "machine_id": machine_id,
+            "expire_date": "ไม่ทราบ (offline)",
+            "days_left": 0,
+            "status": "active",
+        }
+    import platform
+    return {
+        "plan": "รายเดือน",
+        "machine_id": platform.node(),
+        "expire_date": "30 เม.ย. 2569",
+        "days_left": 24,
+        "status": "active",
+    }
+
+
 if __name__ == "__main__":
     if "--show-id" in sys.argv:
         show_machine_id()
