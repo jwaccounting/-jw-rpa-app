@@ -1,7 +1,6 @@
 "use client";
 
 import { useState, useRef, useCallback } from "react";
-import { useAppStore } from "@/store/useAppStore";
 import {
   parseDeleteExcel,
   validateDelete,
@@ -46,7 +45,6 @@ function StatusIcon({ status }: { status: DeleteValidateRow["status"] }) {
 type Step = "upload" | "preview" | "validating" | "validated" | "deleting" | "done";
 
 export default function DeletePage() {
-  const { dbPath } = useAppStore();
   const fileRef = useRef<HTMLInputElement>(null);
 
   const [file,      setFile]      = useState<File | null>(null);

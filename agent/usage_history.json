@@ -1,5 +1,14 @@
 [
   {
+    "id": 1775545655477,
+    "module": "ลบรายการ — IN",
+    "count": 0,
+    "room": "TestRPA",
+    "dbf_path": "Z:\\TestRPA\\",
+    "status": "success",
+    "created_at": "2026-04-07T14:07:35.477283"
+  },
+  {
     "id": 1775541638458,
     "module": "ลบรายการ — IN",
     "count": 0,
