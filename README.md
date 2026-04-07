@@ -104,3 +104,4 @@ git push origin main
 - Build .exe และส่งให้ลูกค้าติดตั้ง
 - Agent จะรันที่ port 9999 เสมอ
 - Web App ส่งข้อมูลผ่าน localhost:9999
+ 
