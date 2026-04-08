@@ -372,20 +372,12 @@ export default function RePage() {
       ═══════════════════════════════════════════════════════════ */}
       <div style={{ background: "#fff", border: "1px solid #E5E7EB", borderRadius: 12, padding: "20px 24px", marginBottom: 16 }}>
 
-        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 14 }}>
-          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-            <span style={{ fontSize: 20 }}>🤖</span>
-            <div>
-              <div style={{ fontSize: 14, fontWeight: 700, color: "#111827" }}>ส่วนที่ 2 — วิเคราะห์จาก PDF Statement (AI)</div>
-              <div style={{ fontSize: 11, color: "#6B7280", marginTop: 1 }}>อัปโหลด Bank Statement PDF — AI จะแยกรายการและจับคู่กับ Invoice อัตโนมัติ</div>
-            </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 14 }}>
+          <span style={{ fontSize: 20 }}>🤖</span>
+          <div>
+            <div style={{ fontSize: 14, fontWeight: 700, color: "#111827" }}>ส่วนที่ 2 — วิเคราะห์จาก PDF Statement (AI)</div>
+            <div style={{ fontSize: 11, color: "#6B7280", marginTop: 1 }}>อัปโหลด Bank Statement PDF — AI จะแยกรายการและจับคู่กับ Invoice อัตโนมัติ</div>
           </div>
-          {(pdfStep === "match" || pdfStep === "importing") && matchRows.length > 0 && (
-            <button onClick={exportExcel}
-              style={{ fontSize: 12, fontWeight: 700, background: "#16A34A", color: "#fff", padding: "8px 20px", borderRadius: 8, border: "none", cursor: "pointer", fontFamily: "inherit", whiteSpace: "nowrap", flexShrink: 0 }}>
-              📥 Export Excel
-            </button>
-          )}
         </div>
 
         {/* Config */}
@@ -432,6 +424,14 @@ export default function RePage() {
             <div style={{ overflowX: "auto" }}>
               <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
                 <thead>
+                  <tr style={{ background: "#F0FDF4", borderBottom: "1px solid #E5E7EB" }}>
+                    <td colSpan={11} style={{ padding: "8px 12px", textAlign: "right" }}>
+                      <button onClick={exportExcel}
+                        style={{ fontSize: 12, fontWeight: 700, background: "#16A34A", color: "#fff", padding: "6px 20px", borderRadius: 8, border: "none", cursor: "pointer", fontFamily: "inherit" }}>
+                        📥 Export Excel
+                      </button>
+                    </td>
+                  </tr>
                   <tr style={{ background: "#F9FAFB", borderBottom: "2px solid #E5E7EB" }}>
                     <th style={{ padding: "8px 10px", textAlign: "center", width: 36 }}>
                       <input type="checkbox" checked={allChecked} onChange={e => setMatchRows(prev => prev.map(r => ({ ...r, selected: e.target.checked })))} style={{ cursor: "pointer", accentColor: "#EA580C" }} />
