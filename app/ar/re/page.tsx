@@ -370,15 +370,7 @@ export default function RePage() {
       {/* ═══════════════════════════════════════════════════════════
           ส่วนที่ 2 — วิเคราะห์จาก PDF Statement (AI)
       ═══════════════════════════════════════════════════════════ */}
-      <div style={{ background: "#fff", border: "1px solid #E5E7EB", borderRadius: 12, padding: "20px 24px", marginBottom: 16, position: "relative" }}>
-
-        {/* Export Excel — มุมขวาบน */}
-        {(pdfStep === "match" || pdfStep === "importing") && matchRows.length > 0 && (
-          <button onClick={exportExcel}
-            style={{ position: "absolute", top: 18, right: 20, fontSize: 11, fontWeight: 700, background: "#16A34A", color: "#fff", padding: "6px 16px", borderRadius: 20, border: "none", cursor: "pointer", fontFamily: "inherit", display: "flex", alignItems: "center", gap: 5 }}>
-            📥 Export Excel
-          </button>
-        )}
+      <div style={{ background: "#fff", border: "1px solid #E5E7EB", borderRadius: 12, padding: "20px 24px", marginBottom: 16 }}>
 
         <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 14 }}>
           <span style={{ fontSize: 20 }}>🤖</span>
@@ -386,6 +378,11 @@ export default function RePage() {
             <div style={{ fontSize: 14, fontWeight: 700, color: "#111827" }}>ส่วนที่ 2 — วิเคราะห์จาก PDF Statement (AI)</div>
             <div style={{ fontSize: 11, color: "#6B7280", marginTop: 1 }}>อัปโหลด Bank Statement PDF — AI จะแยกรายการและจับคู่กับ Invoice อัตโนมัติ</div>
           </div>
+          {(pdfStep === "match" || pdfStep === "importing") && matchRows.length > 0 && (
+            <button onClick={exportExcel} style={{ marginLeft: "auto", fontSize: 11, fontWeight: 700, background: "#16A34A", color: "#fff", padding: "7px 18px", borderRadius: 20, border: "none", cursor: "pointer", fontFamily: "inherit", display: "flex", alignItems: "center", gap: 5, whiteSpace: "nowrap" }}>
+              📥 Export Excel
+            </button>
+          )}
         </div>
 
         {/* Config */}
