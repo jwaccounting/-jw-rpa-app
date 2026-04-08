@@ -409,11 +409,15 @@ export default function RePage() {
         {/* Match Table */}
         {(pdfStep === "match" || pdfStep === "importing") && matchRows.length > 0 && (
           <>
-            {/* Stats */}
-            <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 12 }}>
+            {/* Stats + Export */}
+            <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 12, flexWrap: "wrap" }}>
               <span style={{ fontSize: 11, fontWeight: 600, background: "#DCFCE7", color: "#166534", padding: "3px 12px", borderRadius: 20 }}>✓ จับคู่ {matchedCount}</span>
               <span style={{ fontSize: 11, fontWeight: 600, background: "#FEF9C3", color: "#854D0E", padding: "3px 12px", borderRadius: 20 }}>⚠ บัญชีพัก {unmatchedCount}</span>
               <span style={{ fontSize: 11, fontWeight: 600, background: "#F3F4F6", color: "#6B7280", padding: "3px 12px", borderRadius: 20 }}>รวม {matchRows.length}</span>
+              <button onClick={exportExcel}
+                style={{ marginLeft: "auto", fontSize: 12, fontWeight: 700, background: "#16A34A", color: "#fff", padding: "6px 20px", borderRadius: 8, border: "none", cursor: "pointer", fontFamily: "inherit", whiteSpace: "nowrap" }}>
+                📥 Export Excel
+              </button>
             </div>
 
             {/* Orange info bar */}
@@ -424,14 +428,6 @@ export default function RePage() {
             <div style={{ overflowX: "auto" }}>
               <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
                 <thead>
-                  <tr style={{ background: "#F0FDF4", borderBottom: "1px solid #E5E7EB" }}>
-                    <td colSpan={11} style={{ padding: "8px 12px", textAlign: "right" }}>
-                      <button onClick={exportExcel}
-                        style={{ fontSize: 12, fontWeight: 700, background: "#16A34A", color: "#fff", padding: "6px 20px", borderRadius: 8, border: "none", cursor: "pointer", fontFamily: "inherit" }}>
-                        📥 Export Excel
-                      </button>
-                    </td>
-                  </tr>
                   <tr style={{ background: "#F9FAFB", borderBottom: "2px solid #E5E7EB" }}>
                     <th style={{ padding: "8px 10px", textAlign: "center", width: 36 }}>
                       <input type="checkbox" checked={allChecked} onChange={e => setMatchRows(prev => prev.map(r => ({ ...r, selected: e.target.checked })))} style={{ cursor: "pointer", accentColor: "#EA580C" }} />
