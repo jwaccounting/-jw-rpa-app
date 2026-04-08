@@ -42,10 +42,13 @@ def safe_int(v) -> int:
     except: return 0
 
 def stkcod_to_accnum(stkcod: str) -> str:
-    """4100-02-09 --> 4100-02,  9999-99-SSO --> 9999-99"""
+    """4110-02-04 --> 4100-02,  4100-02-09 --> 4100-02"""
     parts = stkcod.strip().split('-')
     if len(parts) >= 2:
-        return f"{parts[0]}-{parts[1]}"
+        first = parts[0]
+        if first.endswith('10'):
+            first = first[:-2] + '00'
+        return f"{first}-{parts[1]}"
     return stkcod
 
 # ============================================================
@@ -266,6 +269,7 @@ def import_in_from_excel(
                 'VATAMT': vatamt, 'NETAMT': netamt,
                 'NETVAL': netamt, 'REMAMT': netamt,
                 'CMPLAPP': 'N', 'DOCSTAT': 'N', 'SRV_VATTYP': flgvat,
+                'VATDAT': ddate if flgvat != '0' else None,
             })
 
             for item in items:

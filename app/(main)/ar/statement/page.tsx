@@ -2,6 +2,7 @@
 
 import { useState, useRef, useCallback } from "react";
 import { getOpenInvoices, importRE, type OpenInvoice, type ReceiptRow } from "@/lib/arApi";
+import * as XLSX from "xlsx";
 
 // ─── Types ────────────────────────────────────────────────────
 
@@ -259,6 +260,44 @@ export default function StatementPage() {
     setError(null); setResult(null);
   };
 
+  // ── Export Excel ──
+  const handleExportExcel = () => {
+    const rows = matchRows.map(r => ({
+      "วันที่":          r.txn.date,
+      "ยอดโอน (บาท)":   r.txn.amount,
+      "รายละเอียด":      r.txn.description || r.txn.ref || "",
+      "รหัสลูกค้า":      r.selectedCuscod || "",
+      "ชื่อลูกค้า":      r.selectedCuscod
+                          ? (allInvoices.find(i => i.cuscod === r.selectedCuscod) as any)?.cusname ?? ""
+                          : "",
+      "Invoice ค้างชำระ": r.invoice?.docnum ?? "",
+      "ยอดค้างชำระ":     r.invoice?.remamt ?? "",
+      "เลขที่ RE":        r.rcpnum,
+      "WHT":             r.whtamt,
+      "ค่าธรรมเนียม":    r.fee,
+      "สถานะ":           r.matchType === "matched"
+                          ? (r.confidence === "high" ? "จับคู่แล้ว" : "คาดการณ์")
+                          : "บัญชีพัก",
+      "เลือก":           r.selected ? "✓" : "",
+    }));
+
+    const ws = XLSX.utils.json_to_sheet(rows);
+
+    // ปรับความกว้างคอลัมน์
+    ws["!cols"] = [
+      { wch: 12 }, { wch: 14 }, { wch: 30 }, { wch: 12 },
+      { wch: 30 }, { wch: 14 }, { wch: 14 }, { wch: 14 },
+      { wch: 10 }, { wch: 12 }, { wch: 12 }, { wch: 8 },
+    ];
+
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, "RE Statement");
+
+    // ชื่อไฟล์ใช้ชื่อ PDF
+    const baseName = file?.name?.replace(/\.pdf$/i, "") ?? "statement";
+    XLSX.writeFile(wb, `RE_${baseName}.xlsx`);
+  };
+
   // ─── UI ───────────────────────────────────────────────────────
 
   return (
@@ -336,10 +375,23 @@ export default function StatementPage() {
 
       {/* Match Table */}
       {step === "matching" && matchRows.length > 0 && (
-        <div style={{ background: "#fff", border: "1px solid #E5E7EB", borderRadius: 12, padding: "20px 24px", marginBottom: 16 }}>
+        <div style={{ background: "#fff", border: "1px solid #E5E7EB", borderRadius: 12, padding: "20px 24px", marginBottom: 16, position: "relative" }}>
+          <button
+            onClick={handleExportExcel}
+            style={{
+              position: "absolute", top: 16, right: 20,
+              display: "flex", alignItems: "center", gap: 5,
+              padding: "6px 16px", borderRadius: 8,
+              border: "1px solid #16A34A",
+              background: "#F0FDF4", color: "#15803D",
+              fontSize: 11, fontWeight: 700, cursor: "pointer",
+              fontFamily: "inherit",
+            }}>
+            📥 Export Excel
+          </button>
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 14 }}>
             <div style={{ fontSize: 13, fontWeight: 700, color: "#374151" }}>2. ผลการจับคู่รายการ</div>
-            <div style={{ display: "flex", gap: 8 }}>
+            <div style={{ display: "flex", gap: 8, alignItems: "center", paddingRight: 130 }}>
               <span style={{ fontSize: 11, fontWeight: 600, background: "#DCFCE7", color: "#166534", padding: "3px 10px", borderRadius: 20 }}>✓ จับคู่ {matchedCount}</span>
               <span style={{ fontSize: 11, fontWeight: 600, background: "#FEF9C3", color: "#854D0E", padding: "3px 10px", borderRadius: 20 }}>⚠ บัญชีพัก {unmatchedCount}</span>
               <span style={{ fontSize: 11, fontWeight: 600, background: "#F3F4F6", color: "#374151", padding: "3px 10px", borderRadius: 20 }}>รวม {matchRows.length}</span>

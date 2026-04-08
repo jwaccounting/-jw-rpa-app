@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useRef, useCallback, useEffect, useMemo } from "react";
+import * as XLSX from "xlsx";
 import { importRE, getOpenInvoices, type ReceiptRow, type OpenInvoice } from "@/lib/arApi";
 
 const fmt = (n: number) => n.toLocaleString("th-TH", { minimumFractionDigits: 2 });
@@ -125,6 +126,35 @@ export default function RePage() {
 
   const reset = () => { setPdfFile(null); setRows([]); setStep("upload"); setError(null); setResult(null); };
 
+  const exportExcel = () => {
+    const data = rows.map((r, i) => ({
+      "#": i + 1,
+      "วันที่": r.date,
+      "ยอดโอน (บาท)": r.amount,
+      "รายละเอียด Statement": r.description,
+      "Ref": r.ref,
+      "รหัสลูกค้า": r.cuscod,
+      "ชื่อลูกค้า": getCustname(r.cuscod),
+      "Invoice ค้างชำระ": r.invDocnum,
+      "เลขที่ RE": r.rcpnum,
+      "WHT": r.whtamt,
+      "ค่าธรรมเนียม": r.fee,
+      "โอนสุทธิ": r.amount - r.whtamt - r.fee,
+      "สถานะ": r.cuscod && r.invDocnum ? "จับคู่แล้ว" : "บัญชีพัก",
+      "นำเข้า": r.checked ? "✓" : "",
+    }));
+    const ws = XLSX.utils.json_to_sheet(data);
+    ws["!cols"] = [
+      { wch: 4 }, { wch: 12 }, { wch: 16 }, { wch: 35 }, { wch: 18 },
+      { wch: 10 }, { wch: 25 }, { wch: 16 }, { wch: 14 }, { wch: 10 },
+      { wch: 12 }, { wch: 14 }, { wch: 12 }, { wch: 8 },
+    ];
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, "RE Statement");
+    const fname = pdfFile ? pdfFile.name.replace(".pdf", "") : "RE_Statement";
+    XLSX.writeFile(wb, `${fname}_${new Date().toISOString().slice(0,10)}.xlsx`);
+  };
+
   const checkedRows = rows.filter(r => r.checked);
 
   return (
@@ -171,10 +201,14 @@ export default function RePage() {
 
       {/* Match Table */}
       {(step === "match" || step === "importing") && rows.length > 0 && (
-        <div style={{ background:"#fff", border:"1px solid #E5E7EB", borderRadius:12, padding:"20px 24px", marginBottom:16 }}>
+        <div style={{ background:"#fff", border:"1px solid #E5E7EB", borderRadius:12, padding:"20px 24px", marginBottom:16, position:"relative" }}>
+          <button onClick={exportExcel}
+            style={{ position:"absolute", top:16, right:20, fontSize:11, fontWeight:700, background:"#16A34A", color:"#fff", padding:"5px 16px", borderRadius:20, border:"none", cursor:"pointer", fontFamily:"inherit", display:"flex", alignItems:"center", gap:5 }}>
+            📥 Export Excel
+          </button>
           <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:14 }}>
             <div style={{ fontSize:13, fontWeight:700, color:"#374151" }}>2. ผลการจับคู่รายการ</div>
-            <div style={{ display:"flex", gap:8 }}>
+            <div style={{ display:"flex", gap:8, alignItems:"center", paddingRight:130 }}>
               {matchedCount > 0 && <span style={{ fontSize:11, fontWeight:600, background:"#DCFCE7", color:"#166534", padding:"3px 12px", borderRadius:20 }}>✓ จับคู่ {matchedCount}</span>}
               {pendCount > 0   && <span style={{ fontSize:11, fontWeight:600, background:"#FEF9C3", color:"#854D0E", padding:"3px 12px", borderRadius:20 }}>⚠ บัญชีพัก {pendCount}</span>}
               <span style={{ fontSize:11, fontWeight:600, background:"#F3F4F6", color:"#6B7280", padding:"3px 12px", borderRadius:20 }}>รวม {rows.length}</span>

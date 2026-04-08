@@ -210,10 +210,17 @@ def get_default(cfg, key):
 # ── helpers ──────────────────────────────────────────────────
 
 def stkcod_to_gl(stkcod: str) -> str:
-    """แปลง STKCOD → GL account: '4100-02-09' → '4100-02'"""
+    """แปลง STKCOD → GL account
+    เช่น '4110-02-04' → '4100-02'
+         '4100-02-04' → '4100-02'
+    """
     parts = stkcod.strip().split("-")
     if len(parts) >= 2:
-        return f"{parts[0]}-{parts[1]}"
+        first = parts[0]
+        # เปลี่ยน 4110 → 4100 (หรือ XX10 → XX00)
+        if first.endswith("10"):
+            first = first[:-2] + "00"
+        return f"{first}-{parts[1]}"
     return stkcod
 
 def get_fields(filepath):
@@ -422,7 +429,7 @@ def write_one_in(artrn_fields, stcrd_fields, gljnl_fields, gljnlit_fields,
         "CMPLAPP":"N","CMPLDAT":None,"DOCSTAT":"N","CSHRCV":0.0,
         "CHQRCV":0.0,"INTRCV":0.0,"BEFTAX":0.0,"TAXRAT":None,
         "TAXCOND":" ","TAX":0.0,"IVCAMT":0.0,"CHQPAS":0.0,
-        "VATDAT":None,"VATPRD":None,"VATLATE":" ","SRV_VATTYP":"2",
+        "VATDAT":docdat if flgvat != "0" else None,"VATPRD":date(docdat.year,docdat.month,1) if flgvat != "0" else None,"VATLATE":" ","SRV_VATTYP":"2",
         "DLVBY":"  ","RESERVE":None,"USERID":USERID,"CHGDAT":today,
         "USERPRN":" "*8,"PRNDAT":None,"PRNCNT":None,"PRNTIM":" "*8,
         "AUTHID":" "*8,"APPROVE":None,"BILLTO":" "*10,"ORGNUM":0,
