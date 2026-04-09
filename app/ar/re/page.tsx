@@ -2,10 +2,9 @@
 
 import { useState, useRef, useCallback, useEffect, useMemo } from "react";
 import {
-  importRE, getOpenInvoices, parseREExcel,
-  type ReceiptRow, type OpenInvoice,
+  importRE, getOpenInvoices, parseREExcel, getGlAccounts,
+  type ReceiptRow, type OpenInvoice, type GlAccount, type ReGlAccts,
 } from "@/lib/arApi";
-import * as XLSX from "xlsx";
 
 // ─── Types ────────────────────────────────────────────────────
 
@@ -29,6 +28,7 @@ interface MatchRow {
   rcpnum: string;
   whtamt: number;
   fee: number;
+  otherexp: number;
   confidence: Confidence;
   selected: boolean;
   pendCuscod: string;
@@ -107,8 +107,15 @@ export default function RePage() {
   const [pdfError, setPdfError]   = useState<string | null>(null);
   const [pdfResult, setPdfResult] = useState<{ success: number; skipped: number; errors: number; details: { rcpnum: string; status: string; msg?: string }[] } | null>(null);
 
+  // GL account mapping states
+  const [glAccounts, setGlAccounts] = useState<GlAccount[]>([]);
+  const [whtAcct,   setWhtAcct]   = useState("");
+  const [feeAcct,   setFeeAcct]   = useState("");
+  const [otherAcct, setOtherAcct] = useState("");
+
   useEffect(() => {
     getOpenInvoices().then(setOpenInvoices).catch(() => {});
+    getGlAccounts().then(setGlAccounts).catch(() => {});
   }, []);
 
   const customers = useMemo(() => {
@@ -175,7 +182,7 @@ export default function RePage() {
         return {
           id: String(i), txn, matchType: docnums.length > 0 ? "matched" : "unmatched",
           selectedCuscod: cuscod, selectedInvDocnums: docnums,
-          rcpnum: genRcpnum(txn.date, i), whtamt, fee: 0,
+          rcpnum: genRcpnum(txn.date, i), whtamt, fee: 0, otherexp: 0,
           confidence, selected: true, pendCuscod,
         };
       });
@@ -202,21 +209,24 @@ export default function RePage() {
     const receipts: ReceiptRow[] = selectedRows.map(r => {
       const invs = r.selectedInvDocnums.map(dn => openInvoices.find(i => i.docnum === dn)).filter(Boolean) as OpenInvoice[];
       const totalRcv = invs.reduce((s, i) => s + i.remamt, 0);
-      const transfer = r.txn.amount - r.whtamt - r.fee;
+      const transfer = r.txn.amount;
+      const cusname = getCustname(r.selectedCuscod) || r.selectedCuscod || r.txn.description;
+      const desc = cusname.slice(0, 50);
       return {
         rcpnum: r.rcpnum, rcpdat: r.txn.date,
         cuscod: r.selectedCuscod || pendCuscod,
-        custname: r.txn.description.slice(0, 50),
+        custname: desc,
         paytyp: "T" as const, bnkcod: "KBANK",
         chqnum: r.txn.ref || r.rcpnum, chqdat: r.txn.date,
-        whtrat: 0, whtamt: r.whtamt, fee: r.fee,
-        transfer, suspend: invs.length > 0 ? Math.max(transfer - totalRcv, 0) : transfer,
-        remark: r.txn.description.slice(0, 50),
+        whtrat: 0, whtamt: r.whtamt, fee: r.fee, otherexp: r.otherexp,
+        transfer, suspend: invs.length > 0 ? Math.max(totalRcv - r.txn.amount - r.whtamt, 0) : transfer,
+        remark: desc,
         items: invs.map(inv => ({ docnum: inv.docnum, rcvamt: inv.remamt, vatamt: 0 })),
       };
     });
+    const glAccts: ReGlAccts = { whtAcct, feeAcct, otherAcct };
     try {
-      const res = await importRE(receipts);
+      const res = await importRE(receipts, glAccts);
       setPdfResult({ success: res.success, skipped: res.skipped ?? 0, errors: res.error ?? 0, details: res.details.map(d => ({ ...d, rcpnum: d.rcpnum ?? "" })) });
       setPdfStep("done");
     } catch (e) {
@@ -227,38 +237,134 @@ export default function RePage() {
   const resetPdf = () => { setPdfFile(null); setMatchRows([]); setPdfStep("upload"); setPdfError(null); setPdfResult(null); };
 
   // ── Export Excel ──
-  const exportExcel = () => {
-    const data = matchRows.map((r, i) => {
-      const invs = r.selectedInvDocnums.map(dn => openInvoices.find(inv => inv.docnum === dn)).filter(Boolean) as OpenInvoice[];
-      return {
-        "#": i + 1,
-        "วันที่": r.txn.date,
-        "ยอดโอน (บาท)": r.txn.amount,
-        "รายละเอียด": r.txn.description,
-        "Ref": r.txn.ref,
-        "รหัสลูกค้า": r.selectedCuscod,
-        "ชื่อลูกค้า": getCustname(r.selectedCuscod),
-        "Invoice ค้างชำระ": r.selectedInvDocnums.join(", "),
-        "จำนวนบิล": r.selectedInvDocnums.length,
-        "ยอดรวม Invoice": invs.reduce((s, inv) => s + inv.remamt, 0),
-        "เลขที่ RE": r.rcpnum,
-        "WHT": r.whtamt,
-        "ค่าธรรมเนียม": r.fee,
-        "โอนสุทธิ": r.txn.amount - r.whtamt - r.fee,
-        "สถานะ": r.selectedInvDocnums.length > 0 ? "จับคู่แล้ว" : "บัญชีพัก",
-        "นำเข้า": r.selected ? "✓" : "",
+  const exportExcel = async () => {
+    const ExcelJS = (await import("exceljs")).default;
+    const wb = new ExcelJS.Workbook();
+    const ws = wb.addWorksheet("RE Statement");
+
+    // ── คอลัมน์ ──
+    const cols = [
+      { header: "#",                  key: "no",       width: 5,  align: "center" as const },
+      { header: "วันที่",              key: "date",     width: 13, align: "center" as const },
+      { header: "ยอดโอน (บาท)",       key: "amount",   width: 16, align: "right"  as const },
+      { header: "รายละเอียด",          key: "desc",     width: 35, align: "left"   as const },
+      { header: "Ref",                key: "ref",      width: 18, align: "center" as const },
+      { header: "รหัสลูกค้า",          key: "cuscod",  width: 12, align: "center" as const },
+      { header: "ชื่อลูกค้า",          key: "cusname", width: 28, align: "left"   as const },
+      { header: "Invoice ค้างชำระ",   key: "invs",    width: 30, align: "left"   as const },
+      { header: "จำนวนบิล",           key: "invqty",  width: 9,  align: "center" as const },
+      { header: "ยอดรวม Invoice",     key: "invtotal", width: 16, align: "right"  as const },
+      { header: "เลขที่ RE",           key: "rcpnum",  width: 14, align: "center" as const },
+      { header: "WHT",                key: "wht",     width: 12, align: "right"  as const },
+      { header: "ค่าธรรมเนียม",        key: "fee",     width: 14, align: "right"  as const },
+      { header: "ค่าใช้จ่ายอื่น",      key: "other",   width: 14, align: "right"  as const },
+      { header: "โอนสุทธิ",           key: "net",     width: 14, align: "right"  as const },
+      { header: "สถานะ",              key: "status",  width: 12, align: "center" as const },
+      { header: "นำเข้า",             key: "sel",     width: 8,  align: "center" as const },
+    ];
+
+    ws.columns = cols.map(c => ({ header: c.header, key: c.key, width: c.width }));
+
+    // ── style หัวตาราง ──
+    const headerRow = ws.getRow(1);
+    headerRow.height = 24;
+    headerRow.eachCell(cell => {
+      cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF2563EB" } };
+      cell.font = { bold: true, color: { argb: "FFFFFFFF" }, size: 11, name: "Cordia New" };
+      cell.alignment = { horizontal: "center", vertical: "middle", wrapText: false };
+      cell.border = {
+        bottom: { style: "thin", color: { argb: "FFFFFFFF" } },
+        right:  { style: "thin", color: { argb: "FFFFFFFF" } },
       };
     });
-    const ws = XLSX.utils.json_to_sheet(data);
-    ws["!cols"] = [
-      { wch: 4 }, { wch: 12 }, { wch: 14 }, { wch: 35 }, { wch: 18 },
-      { wch: 10 }, { wch: 25 }, { wch: 30 }, { wch: 8 }, { wch: 16 },
-      { wch: 14 }, { wch: 10 }, { wch: 12 }, { wch: 14 }, { wch: 12 }, { wch: 8 },
-    ];
-    const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, ws, "RE Statement");
+
+    const amtFmt = '#,##0.00';
+    const amtKeys = new Set(["amount", "invtotal", "wht", "fee", "other", "net"]);
+
+    // ── ข้อมูล ──
+    matchRows.forEach((r, i) => {
+      const invs = r.selectedInvDocnums.map(dn => openInvoices.find(inv => inv.docnum === dn)).filter(Boolean) as OpenInvoice[];
+      const invTotal = invs.reduce((s, inv) => s + inv.remamt, 0);
+      const rowData = {
+        no: i + 1,
+        date: r.txn.date,
+        amount: r.txn.amount,
+        desc: r.txn.description,
+        ref: r.txn.ref,
+        cuscod: r.selectedCuscod,
+        cusname: getCustname(r.selectedCuscod),
+        invs: r.selectedInvDocnums.join(", "),
+        invqty: r.selectedInvDocnums.length,
+        invtotal: invTotal,
+        rcpnum: r.rcpnum,
+        wht: r.whtamt,
+        fee: r.fee,
+        other: r.otherexp,
+        net: r.txn.amount,
+        status: r.selectedInvDocnums.length > 0 ? "จับคู่แล้ว" : "บัญชีพัก",
+        sel: r.selected ? "✓" : "",
+      };
+      const row = ws.addRow(rowData);
+      row.height = 20;
+      const bgColor = i % 2 === 0 ? "FFFFFFFF" : "FFEFF6FF";
+      row.eachCell((cell, colNum) => {
+        const key = cols[colNum - 1]?.key ?? "";
+        const align = cols[colNum - 1]?.align ?? "center";
+        cell.alignment = { horizontal: align, vertical: "middle" };
+        cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: bgColor } };
+        cell.border = {
+          bottom: { style: "thin", color: { argb: "FFE5E7EB" } },
+          right:  { style: "thin", color: { argb: "FFE5E7EB" } },
+        };
+        cell.font = { name: "Cordia New", size: 12 };
+        if (amtKeys.has(key) && typeof cell.value === "number") {
+          cell.numFmt = amtFmt;
+        }
+      });
+    });
+
+    // ── แถวผลรวม ──
+    const totalRow = ws.addRow({
+      no: "",
+      date: `รวม ${matchRows.length} รายการ`,
+      amount: matchRows.reduce((s, r) => s + r.txn.amount, 0),
+      desc: "", ref: "", cuscod: "", cusname: "", invs: "",
+      invqty: "",
+      invtotal: matchRows.reduce((s, r) => {
+        const invs = r.selectedInvDocnums.map(dn => openInvoices.find(inv => inv.docnum === dn)).filter(Boolean) as OpenInvoice[];
+        return s + invs.reduce((a, inv) => a + inv.remamt, 0);
+      }, 0),
+      rcpnum: "",
+      wht: matchRows.reduce((s, r) => s + r.whtamt, 0),
+      fee: matchRows.reduce((s, r) => s + r.fee, 0),
+      other: matchRows.reduce((s, r) => s + r.otherexp, 0),
+      net: matchRows.reduce((s, r) => s + r.txn.amount, 0),
+      status: "", sel: "",
+    });
+    totalRow.height = 22;
+    totalRow.eachCell((cell, colNum) => {
+      const key = cols[colNum - 1]?.key ?? "";
+      cell.font = { bold: true, name: "Cordia New", size: 12, color: { argb: "FF1D4ED8" } };
+      cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFDBEAFE" } };
+      cell.alignment = { horizontal: amtKeys.has(key) ? "right" : colNum === 2 ? "left" : "center", vertical: "middle" };
+      cell.border = {
+        top:    { style: "medium", color: { argb: "FF2563EB" } },
+        bottom: { style: "medium", color: { argb: "FF2563EB" } },
+        right:  { style: "thin",   color: { argb: "FFE5E7EB" } },
+      };
+      if (amtKeys.has(key) && typeof cell.value === "number") cell.numFmt = amtFmt;
+    });
+
+    // ── download ──
+    const buf = await wb.xlsx.writeBuffer();
+    const blob = new Blob([buf], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
     const fname = pdfFile ? pdfFile.name.replace(".pdf", "") : "RE_Statement";
-    XLSX.writeFile(wb, `${fname}_${new Date().toISOString().slice(0, 10)}.xlsx`);
+    a.download = `${fname}_${new Date().toISOString().slice(0, 10)}.xlsx`;
+    a.click();
+    URL.revokeObjectURL(url);
   };
 
   // ─── UI ───────────────────────────────────────────────────────
@@ -432,9 +538,37 @@ export default function RePage() {
                     <th style={{ padding: "8px 10px", textAlign: "center", width: 36 }}>
                       <input type="checkbox" checked={allChecked} onChange={e => setMatchRows(prev => prev.map(r => ({ ...r, selected: e.target.checked })))} style={{ cursor: "pointer", accentColor: "#EA580C" }} />
                     </th>
-                    {["วันที่", "ยอดโอน (บาท)", "รายละเอียด", "รหัสลูกค้า", "ชื่อลูกค้า", "Invoice ค้างชำระ (เลือกหลายบิลได้)", "เลขที่ RE", "WHT", "ค่าธรรมเนียม", "สถานะ"].map(h => (
-                      <th key={h} style={{ padding: "8px 10px", textAlign: ["ยอดโอน (บาท)", "WHT", "ค่าธรรมเนียม"].includes(h) ? "right" : "left", color: "#6B7280", fontWeight: 600, whiteSpace: "nowrap" }}>{h}</th>
+                    {["วันที่", "", "ยอดโอน (บาท)", "รายละเอียด", "รหัสลูกค้า", "ชื่อลูกค้า", "Invoice ค้างชำระ (เลือกหลายบิลได้)", "เลขที่ RE"].map((h, i) => (
+                      <th key={i} style={{ padding: "8px 10px", textAlign: ["ยอดโอน (บาท)"].includes(h) ? "right" : "center", color: "#6B7280", fontWeight: 600, whiteSpace: "nowrap", width: h === "" ? 28 : undefined }}>{h}</th>
                     ))}
+                    {/* WHT header + dropdown */}
+                    <th style={{ padding: "6px 8px", textAlign: "right", color: "#6B7280", fontWeight: 600, minWidth: 140 }}>
+                      <div style={{ fontSize: 11, marginBottom: 3 }}>WHT</div>
+                      <select value={whtAcct} onChange={e => setWhtAcct(e.target.value)}
+                        style={{ border: "1px solid #D1D5DB", borderRadius: 5, padding: "2px 4px", fontSize: 10, width: "100%", fontFamily: "inherit", background: whtAcct ? "#EFF6FF" : "#fff" }}>
+                        <option value="">— เลขที่บัญชี WHT —</option>
+                        {glAccounts.map(a => <option key={a.acctno} value={a.acctno}>{a.acctno} {a.acctnam}</option>)}
+                      </select>
+                    </th>
+                    {/* ค่าธรรมเนียม header + dropdown */}
+                    <th style={{ padding: "6px 8px", textAlign: "right", color: "#6B7280", fontWeight: 600, minWidth: 150 }}>
+                      <div style={{ fontSize: 11, marginBottom: 3 }}>ค่าธรรมเนียม</div>
+                      <select value={feeAcct} onChange={e => setFeeAcct(e.target.value)}
+                        style={{ border: "1px solid #D1D5DB", borderRadius: 5, padding: "2px 4px", fontSize: 10, width: "100%", fontFamily: "inherit", background: feeAcct ? "#EFF6FF" : "#fff" }}>
+                        <option value="">— เลขที่บัญชี ค่าธรรมเนียม —</option>
+                        {glAccounts.map(a => <option key={a.acctno} value={a.acctno}>{a.acctno} {a.acctnam}</option>)}
+                      </select>
+                    </th>
+                    {/* ค่าใช้จ่ายอื่น header + dropdown */}
+                    <th style={{ padding: "6px 8px", textAlign: "right", color: "#6B7280", fontWeight: 600, minWidth: 150 }}>
+                      <div style={{ fontSize: 11, marginBottom: 3 }}>ค่าใช้จ่ายอื่น</div>
+                      <select value={otherAcct} onChange={e => setOtherAcct(e.target.value)}
+                        style={{ border: "1px solid #D1D5DB", borderRadius: 5, padding: "2px 4px", fontSize: 10, width: "100%", fontFamily: "inherit", background: otherAcct ? "#EFF6FF" : "#fff" }}>
+                        <option value="">— เลขที่บัญชี ค่าใช้จ่ายอื่น —</option>
+                        {glAccounts.map(a => <option key={a.acctno} value={a.acctno}>{a.acctno} {a.acctnam}</option>)}
+                      </select>
+                    </th>
+                    <th style={{ padding: "8px 10px", textAlign: "center", color: "#6B7280", fontWeight: 600, whiteSpace: "nowrap" }}>สถานะ</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -449,6 +583,21 @@ export default function RePage() {
                         </td>
                         {/* วันที่ */}
                         <td style={{ padding: "8px 10px", whiteSpace: "nowrap", color: "#374151" }}>{r.txn.date}</td>
+                        {/* indicator dot */}
+                        <td style={{ padding: "8px 4px", textAlign: "center" }}>
+                          {(() => {
+                            const totalInv = r.selectedInvDocnums.map(dn => openInvoices.find(i => i.docnum === dn)?.remamt ?? 0).reduce((a, b) => a + b, 0);
+                            const netInv = totalInv - r.whtamt - r.fee;
+                            const exactMatch = matched && Math.abs(r.txn.amount - netInv) < 0.01;
+                            return (
+                              <span style={{
+                                display: "inline-block", width: 10, height: 10, borderRadius: "50%",
+                                background: exactMatch ? "#16A34A" : "#F59E0B",
+                                boxShadow: exactMatch ? "0 0 4px #16A34A88" : "0 0 4px #F59E0B88",
+                              }} title={exactMatch ? `ยอดตรง (${fmt(totalInv)} - WHT ${fmt(r.whtamt)} - ค่าธรรมเนียม ${fmt(r.fee)} = ${fmt(netInv)})` : matched ? `ส่วนต่าง ${fmt(Math.abs(r.txn.amount - netInv))}` : "ยังไม่จับคู่"} />
+                            );
+                          })()}
+                        </td>
                         {/* ยอด */}
                         <td style={{ padding: "8px 10px", textAlign: "right", fontWeight: 700, color: "#1D4ED8", whiteSpace: "nowrap" }}>{fmt(r.txn.amount)}</td>
                         {/* รายละเอียด */}
@@ -501,14 +650,20 @@ export default function RePage() {
                         </td>
                         {/* WHT */}
                         <td style={{ padding: "6px 8px", minWidth: 80 }}>
-                          <input type="text" value={fmtInput(r.whtamt)} placeholder="0"
+                          <input type="text" value={fmtInput(r.whtamt)} placeholder="0.00"
                             onChange={e => updateRow(r.id, { whtamt: parseInput(e.target.value) })}
                             style={{ border: "1px solid #D1D5DB", borderRadius: 6, padding: "4px 8px", fontSize: 11, width: "100%", fontFamily: "inherit", textAlign: "right" }} />
                         </td>
                         {/* ค่าธรรมเนียม */}
                         <td style={{ padding: "6px 8px", minWidth: 90 }}>
-                          <input type="text" value={fmtInput(r.fee)} placeholder="0"
+                          <input type="text" value={fmtInput(r.fee)} placeholder="0.00"
                             onChange={e => updateRow(r.id, { fee: parseInput(e.target.value) })}
+                            style={{ border: "1px solid #D1D5DB", borderRadius: 6, padding: "4px 8px", fontSize: 11, width: "100%", fontFamily: "inherit", textAlign: "right" }} />
+                        </td>
+                        {/* ค่าใช้จ่ายอื่น */}
+                        <td style={{ padding: "6px 8px", minWidth: 90 }}>
+                          <input type="text" value={fmtInput(r.otherexp)} placeholder="0.00"
+                            onChange={e => updateRow(r.id, { otherexp: parseInput(e.target.value) })}
                             style={{ border: "1px solid #D1D5DB", borderRadius: 6, padding: "4px 8px", fontSize: 11, width: "100%", fontFamily: "inherit", textAlign: "right" }} />
                         </td>
                         {/* สถานะ */}
@@ -524,8 +679,9 @@ export default function RePage() {
                 <tfoot>
                   <tr style={{ background: "#F9FAFB", borderTop: "2px solid #E5E7EB" }}>
                     <td colSpan={2} style={{ padding: "8px 10px", fontWeight: 700, fontSize: 12, color: "#374151" }}>รวม {selectedRows.length} รายการ</td>
+                    <td style={{ padding: "8px 4px" }} />
                     <td style={{ padding: "8px 10px", textAlign: "right", fontWeight: 700, color: "#1D4ED8" }}>{fmt(selectedRows.reduce((s, r) => s + r.txn.amount, 0))}</td>
-                    <td colSpan={7} />
+                    <td colSpan={8} />
                   </tr>
                 </tfoot>
               </table>
